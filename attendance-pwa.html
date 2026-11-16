@@ -1,0 +1,987 @@
+<!DOCTYPE html>
+<html lang="bn">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1e4e79">
+<title>USM হাজিরা</title>
+<!--
+  USM external attendance client (Phase 4.2). Host on any HTTPS static host (camera + GPS need HTTPS).
+  Transport: POST text/plain JSON to the Apps Script /exec URL, redirect follow, credentials omit, token in body.
+  The server decides IN/OUT, work date, branch, geofence and face match; this page only captures.
+-->
+<!-- Face library + models: SELF-HOSTED, pinned @vladmandic/face-api 1.7.13 (no live CDN in production).
+     tools/vendor-face-api.sh builds vendor/face-api/ (face-api.js + tiny_face_detector, face_landmark_68, face_recognition);
+     upload that folder AND usm-face-sw.js next to this page. The integrity hash pins the exact library version.
+     6.5c: the library is loaded without blocking the page (this tag is configuration only); usm-face-sw.js keeps
+     the library + models in a versioned local cache (usm-face-1.7.13-v1) so later opens do not download them. -->
+<script type="application/json" id="faceCfg" data-faceapi data-version="1.7.13" data-src="vendor/face-api/face-api.js" data-model="vendor/face-api/model"
+        data-integrity="sha384-5SEinnOIOK1Nl6bzEIWwfXWMg4EaJhN2bXKgrjYC0Bq+fYNZHwhD3ntM92lTHnfL" data-sw="usm-face-sw.js">{}</script>
+<style>
+  :root { --bg:#f3f5f8; --card:#fff; --ink:#1b2430; --muted:#5d6b7a; --pri:#1e4e79; --ok:#1b7f4b; --bad:#b3261e; --line:#dde3ea; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#11161c; --card:#1a2129; --ink:#e7edf3; --muted:#9aa8b6; --pri:#6aa5d8; --ok:#5cc28c; --bad:#ff8a80; --line:#2a333d; } }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, "Noto Sans Bengali", sans-serif; background:var(--bg); color:var(--ink); }
+  .wrap { max-width:460px; margin:0 auto; padding:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:16px; margin-bottom:12px; }
+  h1 { font-size:20px; margin:4px 0 12px; } .muted { color:var(--muted); font-size:13px; }
+  input, button { width:100%; font:inherit; padding:12px; border-radius:10px; border:1px solid var(--line); background:var(--card); color:var(--ink); }
+  button { background:var(--pri); color:#fff; border:0; font-weight:600; margin-top:8px; } button.sec { background:transparent; color:var(--pri); border:1px solid var(--pri); }
+  button:disabled { opacity:.5; }
+  label { display:block; font-size:13px; margin:10px 0 4px; color:var(--muted); }
+  video { width:100%; border-radius:12px; background:#000; aspect-ratio:3/4; object-fit:cover; transform:scaleX(-1); }
+  .big { font-size:28px; font-weight:700; } .ok { color:var(--ok); } .bad { color:var(--bad); }
+  .hidden { display:none; } pre { white-space:pre-wrap; font-size:11px; color:var(--muted); }
+
+  /* Touch feedback that works on Android as well as desktop. */
+  button { cursor:pointer; min-height:48px; touch-action:manipulation; transition:transform .09s ease,filter .12s ease,box-shadow .12s ease; position:relative; }
+  button:not(:disabled):active, button.is-pressed:not(:disabled) { transform:scale(.975); filter:brightness(.88); box-shadow:inset 0 2px 6px #0002; }
+  button:focus-visible { outline:3px solid var(--pri); outline-offset:2px; }
+  button.is-working { cursor:progress; opacity:.84; padding-left:34px; }
+  button.is-working:before { content:''; position:absolute; width:15px; height:15px; left:12px; top:calc(50% - 8px); border:2px solid currentColor; border-right-color:transparent; border-radius:50%; animation:spin .75s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+  .face-stage { position:relative; overflow:hidden; border-radius:12px; background:#10141a; isolation:isolate; }
+  .face-stage video { display:block; border-radius:12px; }
+  .face-ring { pointer-events:none; position:absolute; left:50%; top:46%; transform:translate(-50%,-50%); width: min(61%,240px); aspect-ratio: 3/4; border:3px solid #ffffffab; border-radius:50%; box-shadow:0 0 0 999px #00000017,inset 0 0 18px #0004; transition:border-color .2s,box-shadow .2s; }
+  .face-scan { display:none; position:absolute; left:10%; right:10%; height:2px; top:15%; background:linear-gradient(90deg,transparent,#8de9ff,transparent); box-shadow:0 0 13px #8de9ff; animation:faceSweep 1.7s ease-in-out infinite alternate; }
+  @keyframes faceSweep { from { top:15%; } to { top:83%; } }
+  .face-status { position:absolute; bottom:10px; left:10px; right:10px; border-radius:9px; padding:9px 11px; background:#111c27d9; color:white; text-align:center; font-weight:650; font-size:14px; }
+  .face-stage[data-stage="checking"] .face-ring { border-color:#68d7ff; box-shadow:0 0 0 999px #00000016,0 0 22px #68d7ff88; }
+  .face-stage[data-stage="checking"] .face-scan { display:block; }
+  .face-stage[data-stage="ready"] .face-ring, .face-stage[data-stage="success"] .face-ring { border-color:#4ce39c; box-shadow:0 0 0 999px #00000014,0 0 21px #4ce39c88; }
+  .face-stage[data-stage="error"] .face-ring { border-color:#ff8a80; }
+  .staff-nav { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin:0 0 12px; }
+  .staff-nav button { min-height:80px; margin:0; background:var(--card); color:var(--ink); border:2px solid var(--line); font-size:16px; touch-action:manipulation; }
+  .staff-nav button.active { border-color:var(--pri); background:var(--pri); color:#fff; }
+  .staff-panel.hidden { display:none; }
+  .staff-panel label { font-size:14px; }
+  .staff-panel select,.staff-panel textarea { width:100%; padding:12px; border:1px solid var(--line); border-radius:10px; background:var(--card); color:var(--ink); font:inherit; }
+  .staff-panel .leave-row { padding:12px 0; border-bottom:1px solid var(--line); }
+  .staff-panel .leave-row:last-child { border-bottom:0; }
+  @media (prefers-reduced-motion:reduce) { button,.face-ring { transition:none; } .face-scan,button.is-working:before { animation:none; } }
+  /* Help & first-use guide (static, no server call) */
+  .help-btn { width:auto; min-height:40px; padding:8px 16px; margin:0 0 10px auto; display:block; font-size:15px; }
+  .hlp-back { position:fixed; inset:0; background:#0008; z-index:50; display:flex; align-items:flex-end; justify-content:center; }
+  .hlp { background:var(--card); color:var(--ink); width:100%; max-width:460px; max-height:88vh; overflow-y:auto; border-radius:16px 16px 0 0; padding:16px; }
+  .hlp input { margin:8px 0; } .hlp details { border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin-bottom:8px; }
+  .hlp summary { font-weight:600; cursor:pointer; } .hlp ol { margin:8px 0 0 18px; padding:0; } .hlp li { margin-bottom:6px; }
+  .tour { position:fixed; left:0; right:0; bottom:0; z-index:60; padding:12px; display:flex; justify-content:center; }
+  .tour-c { background:var(--card); border:2px solid var(--pri); border-radius:14px; padding:14px; max-width:440px; width:100%; box-shadow:0 8px 28px #0005; }
+  .tour-c .row { display:flex; gap:8px; } .tour-c .row button { margin-top:6px; }
+  .tour-hl { outline:3px solid #f5b301; outline-offset:3px; border-radius:12px; }
+  /* v1.5 Employee App: one-tap attendance, 4 tabs, calendar, requests */
+  .staff-nav { grid-template-columns:repeat(4,minmax(0,1fr)); gap:6px; position:sticky; top:0; z-index:5; background:var(--bg); padding:4px 0; }
+  .staff-nav button { min-height:58px; font-size:13px; padding:6px 2px; line-height:1.25; }
+  #act { min-height:76px; font-size:24px; border-radius:16px; }
+  .prog { list-style:none; margin:10px 0 0; padding:0; display:flex; flex-direction:column; gap:4px; }
+  .prog li { color:var(--muted); font-size:14px; } .prog li.on { color:var(--pri); font-weight:700; } .prog li.ok { color:var(--ok); } .prog li.ok:before { content:'✓ '; } .prog li.on:before { content:'● '; }
+  .done { border:2px solid var(--ok); border-radius:14px; padding:14px; text-align:center; margin-top:10px; }
+  .done .t { font-size:26px; font-weight:800; color:var(--ok); } .done .s { font-size:20px; font-weight:700; }
+  .row2 { display:flex; gap:8px; } .row2 > * { flex:1; }
+  .kpi { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; text-align:center; font-size:12px; } .kpi div { border:1px solid var(--line); border-radius:10px; padding:6px 2px; } .kpi b { display:block; font-size:20px; }
+  .cal { display:grid; grid-template-columns:repeat(7,1fr); gap:4px; } .cal div { text-align:center; padding:6px 0; border-radius:8px; font-size:12px; min-height:44px; border:1px solid var(--line); }
+  .cal .h { border:0; color:var(--muted); min-height:0; } .cal b { display:block; font-size:13px; } .cal .sel { outline:2px solid var(--pri); }
+  .c-P { background:#1b7f4b22; } .c-A { background:#b3261e22; } .c-OFF, .c-H { background:#1e4e7922; } .c-PL { background:#8a6d0022; } .c-UL { background:#7a3e8e22; }
+  .seg { display:grid; grid-template-columns:repeat(2,1fr); gap:6px; } .seg button { margin:0; min-height:52px; background:var(--card); color:var(--ink); border:2px solid var(--line); font-size:14px; } .seg button.active { border-color:var(--pri); color:var(--pri); }
+  .req { padding:10px 0; border-bottom:1px solid var(--line); } .req:last-child { border-bottom:0; } .st { font-size:12px; font-weight:700; padding:2px 8px; border-radius:20px; background:var(--line); }
+  .st.PENDING, .st.APPROVED { background:#f5b30133; } .st.DECLINED, .st.REJECTED, .st.CANCELLED { background:#b3261e22; } .st.DISBURSED, .st.APPLIED { background:#1b7f4b22; }
+  .devbox { border:2px solid var(--pri); border-radius:12px; padding:12px; margin-top:10px; } .devbox select, .devbox textarea { width:100%; padding:12px; border:1px solid var(--line); border-radius:10px; font:inherit; background:var(--card); color:var(--ink); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card hidden" id="cfg">
+    <h1>সেটআপ</h1>
+    <label>Apps Script /exec URL</label><input id="url" readonly value="https://script.google.com/macros/s/AKfycbweCGsk7DKleku_GIz-gaOzhharV3fa0hSF3lwH-DY2-s3M5DoasIBDfa8pqhmDWHkAMQ/exec">
+    <button id="saveUrl">সংরক্ষণ</button>
+  </div>
+  <div class="card hidden" id="login">
+    <h1>লগইন</h1>
+    <label>ইউজারনেম</label><input id="u" autocomplete="username">
+    <label>পাসওয়ার্ড</label><input id="p" type="password" autocomplete="current-password">
+    <button id="doLogin">লগইন</button>
+    <button class="sec" id="doKiosk">ম্যানেজার: এই ল্যাপটপ কিয়স্ক হিসেবে নিবন্ধন করুন</button>
+    <p id="lmsg" class="bad"></p>
+    <div id="devBox" class="devbox hidden" role="status" aria-live="polite"></div>
+    <button type="button" class="sec" id="helpBtnLogin">লগইনে সমস্যা? সাহায্য</button>
+  </div>
+  <div class="card hidden" id="pwd">
+    <h1>নতুন PIN / পাসওয়ার্ড দিন</h1>
+    <p class="muted">প্রথম লগইন: ডিফল্ট PIN (যেমন 123456) বা অস্থায়ী পাসওয়ার্ড বদলাতে হবে। কর্মী: নতুন ৬ সংখ্যার PIN দিন — 111111, 123123, 654321-এর মতো সহজ PIN বা নিজের Employee ID চলবে না। ম্যানেজার: কমপক্ষে ৮ অক্ষর, অক্ষর ও সংখ্যা দুটোই।</p>
+    <label for="np1">নতুন পাসওয়ার্ড</label><input id="np1" type="password" autocomplete="new-password">
+    <label for="np2">আবার লিখুন</label><input id="np2" type="password" autocomplete="new-password">
+    <button id="npSave">সংরক্ষণ</button><p id="npMsg" class="bad"></p>
+  </div>
+  <div class="card hidden" id="kpick">
+    <h1>কিয়স্ক নিবন্ধন</h1>
+    <label for="klabel">এই ল্যাপটপের নাম</label><input id="klabel" placeholder="যেমন: Uttara front desk">
+    <div id="kbranches"></div><p class="muted">নিবন্ধনের পর এই ল্যাপটপ শুধু নির্বাচিত শাখার হাজিরা নেবে; শাখা বদলাতে আবার অনুমোদিত নিবন্ধন লাগবে। আপনার লগইন এই ডিভাইসে থাকবে না।</p>
+    <p id="kpmsg" class="bad"></p>
+  </div>
+  <div class="hidden" id="kiosk">
+    <div class="card"><div class="muted">Registered Kiosk</div><div class="big" id="kname">—</div><div class="muted" id="klab"></div><p id="kmsg"></p></div>
+    <div class="card"><div class="face-stage" id="kFaceStage" data-stage="loading"><video id="kv" autoplay playsinline muted></video><div class="face-ring" aria-hidden="true"><div class="face-scan"></div></div><div class="face-status" id="kFaceStatus" role="status" aria-live="polite">ক্যামেরা চালু হচ্ছে…</div></div><div class="muted" id="ksel">নিচে নিজের নাম বাছুন</div>
+      <button id="kgo" disabled>—</button></div>
+    <div class="card" id="kstaff"></div>
+    <div class="card"><button class="sec" id="kexit">কিয়স্ক বন্ধ</button><pre id="kdbg" class="hidden"></pre><pre id="kdbgT" class="hidden"></pre></div>
+  </div>
+  <div class="hidden" id="main">
+    <button type="button" class="sec help-btn" id="helpBtn">? সাহায্য</button>
+    <nav class="staff-nav" aria-label="কর্মীর মেনু">
+      <button type="button" class="active" data-staff-tab="attendance" aria-pressed="true">◉<br>হাজিরা দিন</button>
+      <button type="button" data-staff-tab="calendar" aria-pressed="false">▦<br>আমার হাজিরা</button>
+      <button type="button" data-staff-tab="requests" aria-pressed="false">✎<br>আবেদন</button>
+      <button type="button" data-staff-tab="profile" aria-pressed="false">♙<br>আমার তথ্য</button>
+    </nav>
+    <section id="staffAttendance" class="staff-panel">
+    <div class="card">
+      <div id="who" style="font-weight:700"></div>
+      <div class="big" id="state">—</div>
+      <div class="row2" id="todayInOut"><div>IN: <b id="tIn">—</b></div><div>OUT: <b id="tOut">—</b></div></div>
+      <div class="muted" id="duty"></div>
+      <div class="muted" id="gps">লোকেশন: —</div>
+      <div class="muted hidden" id="setupSteps"></div>
+    </div>
+    <div class="card">
+      <div class="face-stage" id="faceStage" data-stage="loading">
+        <video id="v" autoplay playsinline muted></video>
+        <div class="face-ring" aria-hidden="true"><div class="face-scan"></div></div>
+        <div class="face-status" id="faceStatus" role="status" aria-live="polite">ক্যামেরা চালু হচ্ছে…</div>
+      </div><div class="muted" id="fhint" aria-live="polite">মুখ ক্যামেরার মাঝখানে রাখুন</div>
+      <button id="act" disabled>লোড হচ্ছে…</button>
+      <ol class="prog hidden" id="prog"><li data-s="face">মুখ যাচাই হচ্ছে</li><li data-s="gps">লোকেশন যাচাই হচ্ছে</li><li data-s="save">হাজিরা সংরক্ষণ হচ্ছে</li><li data-s="done">হাজিরা সম্পন্ন</li></ol>
+      <div class="done hidden" id="done" role="status" aria-live="assertive"><div class="t">✓ হাজিরা সম্পন্ন</div><div class="s" id="doneWhat"></div><div class="muted">সার্ভারে সংরক্ষিত সময়</div></div>
+      <p id="msg" role="status" aria-live="polite"></p>
+    </div>
+    <div class="card" id="homeSum">
+      <div class="muted" id="homeMonthLbl">এই মাস</div>
+      <div class="kpi" id="homeMonth"><div><b>—</b>উপস্থিত</div><div><b>—</b>অনুপস্থিত</div><div><b>—</b>সাপ্তাহিক ছুটি</div><div><b>—</b>সবেতন ছুটি</div></div>
+      <div id="homePending" class="muted" style="margin-top:8px"></div>
+      <button class="sec" id="logout">লগআউট</button>
+    </div>
+    </section>
+    <section id="staffCalendar" class="staff-panel hidden">
+      <div class="card"><div class="row2"><button class="sec" id="calPrev" type="button">◀ আগের মাস</button><button class="sec" id="calNext" type="button">পরের মাস ▶</button></div>
+        <h2 id="calLabel" style="text-align:center;margin:10px 0">—</h2>
+        <div class="cal" id="calGrid">লোড হচ্ছে…</div>
+        <div class="kpi" id="calTot" style="margin-top:8px"></div>
+        <p class="muted">P উপস্থিত · A অনুপস্থিত · OFF সাপ্তাহিক ছুটি · H সরকারি ছুটি · PL সবেতন ছুটি · UL বিনা বেতনে ছুটি। দিনে চাপুন — বিস্তারিত দেখুন।</p>
+        <div id="calDay" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+    <section id="staffRequests" class="staff-panel hidden">
+      <div class="card"><div class="seg" id="reqSeg">
+        <button type="button" data-req="leave" class="active">ছুটির আবেদন</button><button type="button" data-req="advance">অগ্রিমের আবেদন</button>
+        <button type="button" data-req="correction">হাজিরা সংশোধনের আবেদন</button><button type="button" data-req="status">আমার আবেদনের অবস্থা</button></div></div>
+      <div class="card staff-panel" data-reqp="leave"><h2>ছুটির আবেদন</h2>
+        <label for="leaveType">ছুটির ধরন</label><select id="leaveType"><option value="">লোড হচ্ছে…</option></select>
+        <div class="row2"><div><label for="leaveFrom">শুরু</label><input id="leaveFrom" type="date"></div><div><label for="leaveTo">শেষ</label><input id="leaveTo" type="date"></div></div>
+        <label for="leaveReason">কারণ</label><textarea id="leaveReason" rows="2" maxlength="500" placeholder="ছুটির কারণ লিখুন"></textarea>
+        <button id="leaveSubmit" type="button">আবেদন জমা দিন</button><p id="leaveSubmitMsg" role="status" aria-live="polite"></p>
+      </div>
+      <div class="card staff-panel hidden" data-reqp="advance"><h2>অগ্রিমের আবেদন</h2>
+        <label for="advAmount">কত টাকা দরকার</label><input id="advAmount" type="number" inputmode="numeric" min="1" step="1">
+        <label for="advMonthly">প্রতি মাসে বেতন থেকে কত কাটবে (প্রস্তাব)</label><input id="advMonthly" type="number" inputmode="numeric" min="1" step="1">
+        <div class="muted" id="advEst"></div>
+        <label for="advReason">কারণ</label><select id="advReason"><option value="">কারণ বাছুন</option><option>চিকিৎসা</option><option>পরিবারের প্রয়োজন</option><option>শিক্ষা</option><option>বাসা ভাড়া</option><option>অন্য কারণ</option></select>
+        <label for="advNote">নোট (ঐচ্ছিক)</label><textarea id="advNote" rows="2" maxlength="300"></textarea>
+        <button id="advSend" type="button">আবেদন জমা দিন</button><p id="advMsg" role="status" aria-live="polite"></p>
+        <p class="muted">ধাপ: ম্যানেজার/HR → ফাইন্যান্স → টাকা প্রদান। টাকা হাতে পাওয়ার পরই বেতন থেকে কিস্তি কাটা শুরু হবে। পরিমাণ ও কিস্তি ফাইন্যান্স চূড়ান্ত করবে।</p>
+      </div>
+      <div class="card staff-panel hidden" data-reqp="correction"><h2>হাজিরা সংশোধনের আবেদন</h2>
+        <p class="muted" id="crHint">যে পাঞ্চটি বাদ পড়েছে সেটি যোগ করার আবেদন করুন (৩১ দিনের মধ্যে)। ম্যানেজার/HR অনুমোদন দিলে হাজিরা ঠিক হবে।</p>
+        <label for="crType">কী যোগ হবে</label><select id="crType"><option value="OUT">OUT (বের হওয়া)</option><option value="IN">IN (আসা)</option></select>
+        <label for="crTime">তারিখ ও সময়</label><input id="crTime" type="datetime-local">
+        <label for="crReason">কারণ</label><input id="crReason" placeholder="যেমন: OUT দিতে ভুলে গেছি">
+        <button id="crSend" type="button">আবেদন পাঠান</button><p id="crMsg"></p>
+      </div>
+      <div class="card staff-panel hidden" data-reqp="status"><h2>আমার আবেদনের অবস্থা</h2><button class="sec" id="reqRefresh" type="button">আবার দেখুন</button>
+        <div id="reqList" role="status" aria-live="polite">এখনো লোড হয়নি</div>
+      </div>
+    </section>
+    <section id="staffProfile" class="staff-panel hidden">
+      <div class="card"><h2>আমার তথ্য</h2><div id="staffProfileInfo" role="status" aria-live="polite"></div>
+      <p class="muted">তথ্যে ভুল থাকলে HR-এর সঙ্গে যোগাযোগ করুন।</p></div>
+    </section>
+    <div class="card hidden" id="dbgCard"><pre id="dbg"></pre><pre id="dbgT"></pre>
+      <button class="sec" id="benchBtn">ইনপুট সাইজ বেঞ্চমার্ক (160 / 224 / 320)</button><pre id="benchOut"></pre></div>
+  </div>
+</div>
+<script>
+(function () {
+  var FA_TAG = document.querySelector('[data-faceapi]');
+  var MODEL = FA_TAG ? FA_TAG.getAttribute('data-model') : 'vendor/face-api/model';
+  var DEBUG = /[?&]debug=1\b/.test(location.search);           // timing panel only for measurement sessions
+  var FACE_INPUT = 224;                                          // fast path for ordinary IN/OUT; registration keeps 320; 224 falls back to 320 if no face
+
+  /* ---------- 6.5c timing (shown with ?debug=1; window.__usmTiming for measurement) ---------- */
+  var TM = window.__usmTiming = { marks: {}, captures: { register: 0, mark: 0, kiosk: 0 }, backend: '' };
+  function tmark(k, ms) { TM.marks[k] = Math.round(ms); if (DEBUG) showTiming(); }
+  function showTiming() {
+    if (typeof $ !== 'function') return;                         // called before the helpers below are defined
+    var m = TM.marks, order = ['html', 'sw', 'lib', 'model_tiny', 'model_landmark', 'model_recognition', 'models_total', 'warmup', 'camera', 'me', 'ready',
+      'detect', 'descriptor', 'capture_total', 'pre_capture', 'pre_used_age', 'api_roundtrip', 'api_server', 'mark_total'];
+    var txt = 'backend ' + (TM.backend || '?') + ' · input ' + FACE_INPUT + ' · captures ' + JSON.stringify(TM.captures) + '\n' +
+      order.filter(function (k) { return m[k] !== undefined; }).map(function (k) { return (k + '               ').slice(0, 18) + m[k] + ' ms'; }).join('\n');
+    var el = $(S && S.mode === 'KIOSK' ? 'kdbgT' : 'dbgT'); if (el) el.textContent = txt;
+  }
+  tmark('html', performance.now());
+  var MODEL_VERSION = 'faceapi-1.7.13-tiny';
+  var $ = function (id) { return document.getElementById(id); };
+  /* One copy of this file per company. Each copy: its own /exec URL below + its own COMPANY_KEY, so two
+   * companies' apps on the same GitHub Pages site never share device id, login or face cache on a phone.
+   * The first (original) company keeps COMPANY_KEY = '' so its registered phones keep working unchanged. */
+  var COMPANY_KEY = 'qfood';                                   // e.g. 'qfood' (letters/digits only) for the second company
+  function sk(k) { return COMPANY_KEY ? COMPANY_KEY + ':' + k : k; }
+  function get(k) { try { return localStorage.getItem(sk(k)) || ''; } catch (e) { return ''; } }
+  function put(k, v) { try { v ? localStorage.setItem(sk(k), v) : localStorage.removeItem(sk(k)); } catch (e) {} }
+  function uid0() { return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + String(Math.random()).slice(2)).replace(/[^A-Za-z0-9]/g, ''); }
+  var DEV = get('usm_device_id'); if (!DEV) { DEV = uid0(); put('usm_device_id', DEV); }   // this phone/laptop; the server keeps only its hash
+  var DEFAULT_EXEC_URL = 'https://script.google.com/macros/s/AKfycbweCGsk7DKleku_GIz-gaOzhharV3fa0hSF3lwH-DY2-s3M5DoasIBDfa8pqhmDWHkAMQ/exec';
+  var S = { url: DEFAULT_EXEC_URL, token: get('usm_att_token'), me: null, pos: null, ready: false, mode: get('usm_mode'), kiosk: null, sel: null, kioskSetup: false, faceRef: null, preFace: null, preFaceP: null, preFaceTimer: null };
+  if (DEBUG) { $('dbgCard').classList.remove('hidden'); $('kdbg').classList.remove('hidden'); $('kdbgT').classList.remove('hidden'); }
+  function show(id) { ['cfg', 'login', 'pwd', 'main', 'kpick', 'kiosk'].forEach(function (x) { $(x).classList.toggle('hidden', x !== id); }); }
+  function uid() { return (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random()).replace(/-/g, ''); }
+  /* ---------- v1.5 Employee App: 4 tabs. Non-attendance screens load lazily (only when opened / after attendance is ready). ---------- */
+  var staffTab = 'attendance', leaveTypesLoaded = false, leaveSubmitting = false, reqTab = 'leave';
+  var SELF = { month: {}, calMonth: '', calSel: '', requests: null, reqAt: 0 };
+  function staffText(el, value) { $(el).textContent = value == null ? '' : String(value); }
+  function esc(x) { return String(x == null ? '' : x).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); }
+  function hm(t) { return t ? String(t).slice(11, 16) : '—'; }
+  function curMonth() { return (S.me && S.me.work_date ? S.me.work_date : new Date().toISOString()).slice(0, 7); }
+  function addMonth(m, n) { var y = +m.slice(0, 4), mo = +m.slice(5, 7) - 1 + n; y += Math.floor(mo / 12); mo = ((mo % 12) + 12) % 12; return y + '-' + ('0' + (mo + 1)).slice(-2); }
+  var MONTH_BN = ['জানুয়ারি', 'ফেব্রুয়ারি', 'মার্চ', 'এপ্রিল', 'মে', 'জুন', 'জুলাই', 'আগস্ট', 'সেপ্টেম্বর', 'অক্টোবর', 'নভেম্বর', 'ডিসেম্বর'];
+  function monthBn(m) { return MONTH_BN[+m.slice(5, 7) - 1] + ' ' + m.slice(0, 4); }
+  function openStaffTab(tab) {
+    if (['attendance', 'calendar', 'requests', 'profile'].indexOf(tab) < 0) return;
+    staffTab = tab;
+    var panels = { attendance: 'staffAttendance', calendar: 'staffCalendar', requests: 'staffRequests', profile: 'staffProfile' };
+    Object.keys(panels).forEach(function (key) { $(panels[key]).classList.toggle('hidden', key !== tab); });
+    document.querySelectorAll('[data-staff-tab]').forEach(function (b) {
+      var selected = b.getAttribute('data-staff-tab') === tab;
+      b.classList.toggle('active', selected); b.setAttribute('aria-pressed', String(selected));
+    });
+    if (tab === 'calendar') loadCalendar(SELF.calMonth || curMonth());
+    if (tab === 'requests') openReq(reqTab);
+    if (tab === 'profile') renderStaffProfile();
+    if (tab === 'attendance' && S.ready) ensureCamera().catch(function () {});
+  }
+  document.querySelectorAll('[data-staff-tab]').forEach(function (b) {
+    b.addEventListener('click', function () { openStaffTab(b.getAttribute('data-staff-tab')); });
+  });
+  function openReq(t) {
+    reqTab = t;
+    document.querySelectorAll('[data-req]').forEach(function (b) { b.classList.toggle('active', b.getAttribute('data-req') === t); });
+    document.querySelectorAll('[data-reqp]').forEach(function (c) { c.classList.toggle('hidden', c.getAttribute('data-reqp') !== t); });
+    if (t === 'leave') loadLeaveTypes();
+    if (t === 'status') loadRequests(true);
+  }
+  document.querySelectorAll('[data-req]').forEach(function (b) { b.addEventListener('click', function () { openReq(b.getAttribute('data-req')); }); });
+  function loadLeaveTypes() {
+    if (leaveTypesLoaded || !S.me) return;
+    staffText('leaveSubmitMsg', 'ছুটির ধরন লোড হচ্ছে…');
+    call('leave.balance', { employee_id: S.me.employee_id }).then(function (data) {
+      var options = (data && data.balance) || [];
+      var select = $('leaveType'); select.textContent = '';
+      var placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = 'ছুটির ধরন বাছুন'; select.appendChild(placeholder);
+      options.forEach(function (x) {
+        var o = document.createElement('option'); o.value = x.leave_type_code;
+        o.textContent = (x.label_bn || x.label || x.leave_type_code) + (x.remaining === null || x.remaining === undefined ? '' : ' (অবশিষ্ট ' + x.remaining + ' দিন)');
+        select.appendChild(o);
+      });
+      leaveTypesLoaded = true; staffText('leaveSubmitMsg', '');
+    }).catch(function (e) { staffText('leaveSubmitMsg', 'ছুটির ধরন লোড হয়নি — ' + e.message); });
+  }
+  $('leaveSubmit').addEventListener('click', function () {
+    if (leaveSubmitting || !S.me) return;
+    var type = $('leaveType').value, from = $('leaveFrom').value, to = $('leaveTo').value, reason = $('leaveReason').value.trim();
+    if (!type || !from || !to || !reason) { staffText('leaveSubmitMsg', 'সব তথ্য পূরণ করুন।'); return; }
+    if (to < from) { staffText('leaveSubmitMsg', 'শেষের তারিখ শুরুর আগে হতে পারে না।'); return; }
+    leaveSubmitting = true; $('leaveSubmit').disabled = true; staffText('leaveSubmitMsg', 'আবেদন পাঠানো হচ্ছে…');
+    var rid = uid();
+    call('leave.request', { request_id: rid, employee_id: S.me.employee_id, leave_type_code: type, from_date: from, to_date: to, reason: reason }, true)
+      .then(function () { staffText('leaveSubmitMsg', '✓ আবেদন জমা হয়েছে — অনুমোদনের অপেক্ষায়। "আমার আবেদনের অবস্থা"-তে দেখুন।'); $('leaveReason').value = ''; leaveTypesLoaded = false; SELF.requests = null; })
+      .catch(function (e) { staffText('leaveSubmitMsg', 'আবেদন জমা হয়নি — ' + e.message); })
+      .then(function () { leaveSubmitting = false; $('leaveSubmit').disabled = false; });
+  });
+  /* advance request: amount + proposed monthly installment; the period shown is only an estimate */
+  function advEstimate() {
+    var a = +$('advAmount').value || 0, m = +$('advMonthly').value || 0;
+    staffText('advEst', a > 0 && m > 0 && m <= a ? 'আনুমানিক ' + Math.ceil(a / m) + ' মাসে শোধ হবে (প্রস্তাব — চূড়ান্ত নয়)' : '');
+  }
+  $('advAmount').addEventListener('input', advEstimate); $('advMonthly').addEventListener('input', advEstimate);
+  var advBusy = false, advRid = '';
+  $('advSend').addEventListener('click', function () {
+    if (advBusy || !S.me) return;
+    var a = +$('advAmount').value, m = +$('advMonthly').value, r = $('advReason').value, note = $('advNote').value.trim();
+    if (!(a > 0) || !(m > 0) || !r) { staffText('advMsg', 'টাকার পরিমাণ, মাসিক কিস্তি ও কারণ দিন।'); return; }
+    if (m > a) { staffText('advMsg', 'মাসিক কিস্তি মোট টাকার বেশি হতে পারে না।'); return; }
+    advBusy = true; $('advSend').disabled = true; staffText('advMsg', 'আবেদন পাঠানো হচ্ছে…');
+    advRid = advRid || uid();                                       // the same id on a retry → never two requests
+    call('advance.selfRequest', { request_id: advRid, amount: a, monthly_amount: m, reason: r, note: note }, true, { requestId: advRid })
+      .then(function () { advRid = ''; staffText('advMsg', '✓ আবেদন জমা হয়েছে — এখন ম্যানেজার/HR দেখবেন। অবস্থা "আমার আবেদনের অবস্থা"-তে।'); $('advAmount').value = ''; $('advMonthly').value = ''; $('advNote').value = ''; advEstimate(); SELF.requests = null; })
+      .catch(function (e) { if (e.code !== 'NETWORK') advRid = ''; staffText('advMsg', e.code === 'ADVANCE_REQUEST_OPEN' ? 'আপনার একটি অগ্রিম আবেদন এখনো চলছে — সেটি শেষ হলে নতুন আবেদন করুন।' : 'আবেদন জমা হয়নি — ' + e.message); })
+      .then(function () { advBusy = false; $('advSend').disabled = false; });
+  });
+  var REQ_KIND_BN = { LEAVE: 'ছুটি', ADVANCE: 'অগ্রিম', CORRECTION: 'হাজিরা সংশোধন' };
+  var REQ_ST_BN = { PENDING: 'অপেক্ষমাণ', APPROVED: 'অনুমোদিত', DECLINED: 'প্রত্যাখ্যাত', REJECTED: 'প্রত্যাখ্যাত', CANCELLED: 'বাতিল', APPLIED: 'সম্পন্ন', DISBURSED: 'টাকা প্রদান হয়েছে', SUPERSEDED: 'পরিবর্তিত' };
+  function loadRequests(show) {
+    if (!S.me) return Promise.resolve(null);
+    if (show) $('reqList').textContent = 'লোড হচ্ছে…';
+    var p = SELF.requests && Date.now() - SELF.reqAt < 60000 ? Promise.resolve(SELF.requests) : call('self.requests').then(function (d) { SELF.requests = d.items || []; SELF.reqAt = Date.now(); return SELF.requests; });
+    return p.then(function (items) {
+      var pend = items.filter(function (x) { return x.status === 'PENDING' || (x.kind === 'ADVANCE' && x.status === 'APPROVED'); });
+      $('homePending').textContent = pend.length ? '⏳ অপেক্ষমাণ আবেদন: ' + pend.map(function (x) { return REQ_KIND_BN[x.kind]; }).join(', ') : '';
+      if (!show) return items;
+      if (!items.length) { $('reqList').textContent = 'এখনো কোনো আবেদন নেই।'; return items; }
+      $('reqList').innerHTML = items.map(function (x) {
+        var canCancel = x.kind === 'ADVANCE' && (x.status === 'PENDING' || x.status === 'APPROVED');
+        return '<div class="req"><b>' + esc(REQ_KIND_BN[x.kind] || x.kind) + '</b> · ' + esc(x.title || '') + ' <span class="st ' + esc(x.status) + '">' + esc(REQ_ST_BN[x.status] || x.status) + '</span>' +
+          (x.stage_label ? '<div class="muted">এখন: ' + esc(x.stage_label) + '</div>' : '') +
+          (x.kind === 'ADVANCE' && x.approved_amount ? '<div class="muted">অনুমোদিত ' + esc(x.approved_amount) + ' টাকা · মাসিক ' + esc(x.approved_monthly) + ' · শুরু ' + esc(x.start_month) + '</div>' : '') +
+          (x.note ? '<div class="bad">কারণ: ' + esc(x.note) + '</div>' : '') + '<div class="muted">' + esc(String(x.at || '').slice(0, 10)) + '</div>' +
+          (canCancel ? '<button type="button" class="sec" data-cancel="' + esc(x.id) + '">আবেদন বাতিল করুন</button>' : '') + '</div>';
+      }).join('');
+      document.querySelectorAll('[data-cancel]').forEach(function (b) { b.onclick = function () {
+        if (!confirm('এই অগ্রিম আবেদন বাতিল করবেন?')) return;
+        b.disabled = true;
+        call('advance.selfCancel', { change_request_id: b.getAttribute('data-cancel') }, true).then(function () { SELF.requests = null; loadRequests(true); }).catch(function (e) { b.disabled = false; alertMsg(e.message); });
+      }; });
+      return items;
+    }).catch(function (e) { if (show) $('reqList').textContent = 'তথ্য পাওয়া যায়নি — ' + e.message; });
+  }
+  function alertMsg(t) { staffText('reqList', t); }
+  $('reqRefresh').addEventListener('click', function () { SELF.requests = null; loadRequests(true); });
+  /* calendar: one employee-month per call, cached in memory for this page */
+  function loadMonth(m, force) {
+    if (!force && SELF.month[m]) return Promise.resolve(SELF.month[m]);
+    return call('attendance.myMonth', { month: m }).then(function (d) { SELF.month[m] = d; return d; });
+  }
+  function renderTotals(el, t) { $(el).innerHTML = ['P', 'A', 'OFF', 'PL'].map(function (k, i) { return '<div><b>' + (t ? t[k] : '—') + '</b>' + ['উপস্থিত', 'অনুপস্থিত', 'সাপ্তাহিক ছুটি', 'সবেতন ছুটি'][i] + '</div>'; }).join(''); }
+  function loadCalendar(m) {
+    SELF.calMonth = m; staffText('calLabel', monthBn(m)); $('calNext').disabled = m >= curMonth(); $('calDay').textContent = '';
+    $('calGrid').textContent = 'লোড হচ্ছে…';
+    loadMonth(m).then(function (d) {
+      if (SELF.calMonth !== m) return;
+      var first = new Date(m + '-01T00:00:00Z').getUTCDay(), last = +d.to.slice(8, 10), h = ['রবি', 'সোম', 'মঙ্গল', 'বুধ', 'বৃহঃ', 'শুক্র', 'শনি'].map(function (x) { return '<div class="h">' + x + '</div>'; }).join('');
+      for (var i = 0; i < first; i++) h += '<div class="h"></div>';
+      for (var k = 1; k <= last; k++) {
+        var day = m + '-' + ('0' + k).slice(-2), x = d.days[day];
+        h += '<div data-day="' + day + '" class="' + (x && x.c ? 'c-' + x.c : '') + '"><b>' + k + '</b>' + (x && x.c ? esc(x.c) : day > d.today ? '' : '·') + '</div>';
+      }
+      $('calGrid').innerHTML = h; renderTotals('calTot', d.totals);
+      document.querySelectorAll('#calGrid [data-day]').forEach(function (c) { c.onclick = function () { calDay(d, c.getAttribute('data-day')); }; });
+    }).catch(function (e) { $('calGrid').textContent = 'হাজিরা পাওয়া যায়নি — ' + e.message; });
+  }
+  var CODE_BN = { P: 'উপস্থিত', A: 'অনুপস্থিত', OFF: 'সাপ্তাহিক ছুটি', H: 'সরকারি ছুটি', PL: 'সবেতন ছুটি', UL: 'বিনা বেতনে ছুটি', S: 'সাসপেন্ড' };
+  function calDay(d, day) {
+    document.querySelectorAll('#calGrid .sel').forEach(function (e) { e.classList.remove('sel'); });
+    var cell = document.querySelector('#calGrid [data-day="' + day + '"]'); if (cell) cell.classList.add('sel');
+    var x = d.days[day] || {}, back = Math.floor((Date.parse(d.today) - Date.parse(day)) / 86400000), canFix = d.can_request_correction && back >= 0 && back <= (d.back_days || 31);
+    $('calDay').innerHTML = '<div class="card" style="margin:10px 0 0"><b>' + esc(day) + '</b> · ' + esc(CODE_BN[x.c] || (day > d.today ? 'সামনের দিন' : 'তথ্য নেই')) +
+      '<div>IN: <b>' + hm(x.in) + '</b> · OUT: <b>' + hm(x.out) + '</b>' + (x.late_min ? ' · দেরি ' + x.late_min + ' মিনিট' : '') + '</div>' +
+      '<div class="muted">' + (x.finalized ? '✓ চূড়ান্ত (বেতনের জন্য লক)' : 'এখনো চূড়ান্ত হয়নি') + (x.corrected ? ' · HR সংশোধন করেছেন' : '') + '</div>' +
+      (canFix ? '<button type="button" class="sec" id="calFix">হাজিরা সংশোধনের আবেদন</button>' : '<div class="muted">৩১ দিনের বেশি পুরনো হলে HR-এর সঙ্গে কথা বলুন।</div>') + '</div>';
+    if ($('calFix')) $('calFix').onclick = function () {
+      $('crType').value = x.in && !x.out ? 'OUT' : 'IN'; $('crTime').value = day + 'T' + (x.in && !x.out ? '18:00' : '09:00');
+      openStaffTab('requests'); openReq('correction'); $('crReason').focus();
+    };
+  }
+  $('calPrev').addEventListener('click', function () { loadCalendar(addMonth(SELF.calMonth || curMonth(), -1)); });
+  $('calNext').addEventListener('click', function () { var n = addMonth(SELF.calMonth || curMonth(), 1); if (n <= curMonth()) loadCalendar(n); });
+  /** Home extras after attendance is ready (never before): this month's totals + pending requests. */
+  function loadHomeExtras() {
+    if (busy) { setTimeout(loadHomeExtras, 3000); return; }       // never compete with an attendance tap
+    if (!S.me || SELF.homeLoading) return;
+    SELF.homeLoading = true; var m = curMonth(); staffText('homeMonthLbl', 'এই মাস · ' + monthBn(m));
+    loadMonth(m, true).then(function (d) { renderTotals('homeMonth', d.totals); }).catch(function () {})
+      .then(function () { return loadRequests(false); }).catch(function () {}).then(function () { SELF.homeLoading = false; });
+  }
+  function renderStaffProfile() {
+    if (!S.me) { staffText('staffProfileInfo', 'তথ্য লোড হচ্ছে…'); return; }
+    var m = S.me;
+    staffText('staffProfileInfo', [m.full_name || '', 'কর্মী আইডি: ' + (m.employee_id || ''),
+      'শাখা: ' + ((m.branch && m.branch.name) || '—'), 'মুখ নিবন্ধন: ' + (m.face_registered ? '✓ সম্পন্ন' : 'বাকি'), 'এই ফোন: ✓ অনুমোদিত'].join('\n'));
+    $('staffProfileInfo').style.whiteSpace = 'pre-line';
+  }
+
+  /* Plain Bengali for every error the employee can meet; unknown/technical errors never reach the screen (?debug=1 shows them). */
+  var ERR_BN = { DEVICE_NOT_REGISTERED: 'এই অ্যাকাউন্ট আগের একটি ফোনে নিবন্ধিত। নতুন ফোনের অনুমোদনের আবেদন করুন।',
+    DEVICE_ID_REQUIRED: 'অ্যাপ পুরনো — পাতাটি আবার লোড করুন।',
+    DEVICE_IN_USE: 'এই ফোন অন্য একজন কর্মীর নামে নিবন্ধিত। এক ফোনে একজন — শাখার কিয়স্ক ব্যবহার করুন বা HR-কে বলুন।',
+    DEVICE_APPROVAL_PENDING: 'আপনার ফোন অনুমোদনের অপেক্ষায় আছে।', DEVICE_REQUEST_REJECTED: 'HR এই ফোনটি অনুমোদন করেননি।',
+    TEMP_PASSWORD_EXPIRED: 'অস্থায়ী পাসওয়ার্ডের মেয়াদ শেষ। HR-এর কাছ থেকে নতুন অস্থায়ী পাসওয়ার্ড নিন।', AUTH_FAILED: 'আইডি বা PIN ভুল।',
+    PASSWORD_WEAK: 'PIN দুর্বল: ৬ সংখ্যার কঠিন PIN দিন (111111, 123456 বা নিজের আইডি চলবে না)। ম্যানেজার: কমপক্ষে ৮ অক্ষর, অক্ষর ও সংখ্যা।',
+    FACE_MISMATCH: 'আলোতে মুখ সোজা রেখে আবার চেষ্টা করুন।', FACE_INVALID: 'আলোতে মুখ সোজা রেখে আবার চেষ্টা করুন।', FACE_REPLAY: 'নতুন করে মুখ দেখিয়ে আবার চেষ্টা করুন।',
+    FACE_MULTIPLE: 'ক্যামেরায় শুধু আপনি থাকুন — অন্যরা সরে দাঁড়ান।', FACE_NOT_REGISTERED: 'প্রথমে মুখ নিবন্ধন করুন।', FACE_EXISTS: 'মুখ আগেই নিবন্ধিত — পাতা আবার খুলুন।',
+    ATT_GEO_REQUIRED: 'লোকেশন চালু করুন।', ATT_GEO_OUTSIDE: 'আপনি শাখার এলাকার বাইরে — শাখার ভিতরে এসে আবার চেষ্টা করুন।', ATT_GEO: 'লোকেশন চালু করুন।', ATT_GEO_CONFIG: 'শাখার লোকেশন সেট করা নেই — ম্যানেজারকে জানান।',
+    ATT_DUPLICATE: 'এইমাত্র হাজিরা নেওয়া হয়েছে — আবার লাগবে না।', ATT_SEQUENCE: 'হাজিরার অবস্থা বদলেছে — একটু পরে আবার দেখুন।', ATT_FINALIZED: 'এই দিনের হাজিরা চূড়ান্ত — সংশোধনের আবেদন করুন।',
+    ATT_BRANCH: 'আজ আপনার কোনো শাখা নির্ধারিত নেই — ম্যানেজারকে জানান।', ROSTER_BRANCH: 'আজ আপনার কোনো শাখা নির্ধারিত নেই — ম্যানেজারকে জানান।',
+    STATE_INVALID: 'এই কাজটি এখন করা যাবে না।', LEAVE_OVERLAP: 'এই তারিখে আগেই ছুটির আবেদন আছে।', ADVANCE_REQUEST_OPEN: 'আপনার একটি অগ্রিম আবেদন এখনো চলছে।',
+    VALIDATION_RANGE: 'তথ্য ঠিক নেই — তারিখ/পরিমাণ দেখে আবার দিন।', VALIDATION_REQUIRED: 'সব ঘর পূরণ করুন।', VALIDATION_TYPE: 'তথ্য ঠিক নেই — আবার দেখুন।',
+    FORBIDDEN: 'এই কাজের অনুমতি নেই।', NOT_FOUND: 'তথ্য পাওয়া যায়নি।', QUOTA_EXCEEDED: 'সার্ভার ব্যস্ত — একটু পরে আবার চেষ্টা করুন।', MAINTENANCE: 'সিস্টেম রক্ষণাবেক্ষণ চলছে — একটু পরে চেষ্টা করুন।',
+    INTERNAL: 'সার্ভারে সমস্যা — একটু পরে আবার চেষ্টা করুন।', NETWORK: 'ইন্টারনেট সংযোগ পরীক্ষা করুন।',
+    AUTH_REQUIRED: 'আবার লগইন করুন।', SESSION_EXPIRED: 'আবার লগইন করুন।', SESSION_INVALID: 'আবার লগইন করুন।', PASSWORD_CHANGE_REQUIRED: 'আবার লগইন করে নতুন PIN দিন।' };
+  function bnMsg(code, raw) { return ERR_BN[code] || (/[ঀ-৿]/.test(raw || '') ? raw : /AUTH|SESSION|TOKEN/.test(code || '') ? 'আবার লগইন করুন।' : 'কাজটি হয়নি — আবার চেষ্টা করুন। বারবার হলে HR-কে জানান।'); }
+  /** opts: { requestId (stable id for a retry), timeoutMs }. A lost/late response throws code NETWORK (outcome unknown — never shown as success). */
+  function call(fn, args, write, opts) {
+    opts = opts || {};
+    var body = { fn: fn, args: args || {}, token: S.token || undefined, requestId: write ? (opts.requestId || uid()) : undefined, perf: DEBUG || undefined };
+    var t0 = performance.now(), ctl = window.AbortController ? new AbortController() : null, timer = null;
+    if (ctl) timer = setTimeout(function () { ctl.abort(); }, opts.timeoutMs || 45000);
+    return fetch(S.url, { method: 'POST', redirect: 'follow', credentials: 'omit', headers: { 'Content-Type': 'text/plain;charset=utf-8' }, body: JSON.stringify(body), signal: ctl ? ctl.signal : undefined })
+      .then(function (r) { return r.json(); }, function () { var e = new Error(ERR_BN.NETWORK); e.code = 'NETWORK'; throw e; })
+      .then(function (res) {
+        if (timer) clearTimeout(timer);
+        if (DEBUG) ($(S.mode === 'KIOSK' ? 'kdbg' : 'dbg')).textContent = fn + ' · ' + Math.round(performance.now() - t0) + ' ms (server ' + (res.ms || '?') + ' ms)' +
+          (res.data && res.data.ms ? '\n' + JSON.stringify(res.data.ms) : '') + (res.perf ? '\nreads ' + res.perf.reads + ' · cells ' + res.perf.cells + ' · read ' + res.perf.read_ms + ' ms · ' + (res.perf.repeated || []).join(',') : '') +
+          (!res.ok ? '\n' + res.code + ': ' + res.message : '');
+        if (fn === 'attendance.self' || fn === 'kiosk.mark') tmark('api_server', res.ms || 0);
+        if (!res.ok) { var e = new Error(bnMsg(res.code, res.message)); e.code = res.code; e.details = res.details || {}; throw e; }
+        return res.data;
+      }, function (err) { if (timer) clearTimeout(timer); if (err && err.code === 'NETWORK') throw err; var e = new Error(ERR_BN.NETWORK); e.code = 'NETWORK'; throw e; });
+  }
+
+  var gpsWatching = false;
+  function watchGps() {
+    if (!navigator.geolocation) { $('gps').textContent = 'এই ফোনে GPS নেই'; return; }
+    if (gpsWatching) return; gpsWatching = true;
+    navigator.geolocation.watchPosition(function (p) {
+      S.pos = { lat: p.coords.latitude, lng: p.coords.longitude, acc: Math.round(p.coords.accuracy), at: Date.now() };
+      $('gps').textContent = 'লোকেশন পাওয়া গেছে (±' + S.pos.acc + ' m)';
+    }, function (er) { S.posErr = er && er.code === 1 ? 'DENIED' : 'OFF'; $('gps').textContent = 'লোকেশন বন্ধ — লোকেশন চালু করুন'; }, { enableHighAccuracy: true, maximumAge: 10000, timeout: 20000 });
+  }
+  /** Location evidence for this tap: the watch fix if ≤ 20 s old, else one fresh fix (≤ 12 s). null = none. */
+  function freshPos() {
+    if (S.pos && Date.now() - S.pos.at <= 20000) return Promise.resolve(S.pos);
+    if (!navigator.geolocation) return Promise.resolve(null);
+    return new Promise(function (resolve) {
+      navigator.geolocation.getCurrentPosition(function (p) { S.pos = { lat: p.coords.latitude, lng: p.coords.longitude, acc: Math.round(p.coords.accuracy), at: Date.now() }; resolve(S.pos); },
+        function (er) { S.posErr = er && er.code === 1 ? 'DENIED' : 'OFF'; resolve(null); }, { enableHighAccuracy: true, maximumAge: 15000, timeout: 12000 });
+    });
+  }
+
+  /* ---------- 6.5c face engine: one load per page, started at page open, warmed before the first tap ---------- */
+  var FACE = { p: null, ready: false };
+  function swReady() {                                           // versioned asset cache; never caches API calls or descriptors
+    var t0 = performance.now(), url = FA_TAG && FA_TAG.getAttribute('data-sw');
+    if (!url || !('serviceWorker' in navigator)) return Promise.resolve();
+    // Registration must never block face startup. The browser HTTP cache serves this visit; the SW owns later visits.
+    return navigator.serviceWorker.register(url).catch(function () {}).then(function () { tmark('sw', performance.now() - t0); });
+  }
+  function loadLib() {
+    if (window.faceapi) return Promise.resolve();
+    var t0 = performance.now();
+    return new Promise(function (resolve, reject) {
+      var sc = document.createElement('script');
+      sc.src = FA_TAG.getAttribute('data-src'); sc.integrity = FA_TAG.getAttribute('data-integrity'); sc.crossOrigin = 'anonymous'; sc.async = true;
+      sc.onload = function () { tmark('lib', performance.now() - t0); resolve(); };
+      sc.onerror = function () { reject(new Error('মুখ শনাক্তকরণ লাইব্রেরি লোড হয়নি — ইন্টারনেট দেখে পাতা আবার খুলুন।')); };
+      document.head.appendChild(sc);
+    });
+  }
+  function timedLoad(net, key) { var t0 = performance.now(); return net.loadFromUri(MODEL).then(function () { tmark(key, performance.now() - t0); }); }
+  /** Compile/upload every network once on a blank input (no face, nothing kept or sent) so the first real tap is fast. */
+  function warmup() {
+    var t0 = performance.now(), c = document.createElement('canvas'); c.width = 150; c.height = 150;
+    var c2 = document.createElement('canvas'); c2.width = FACE_INPUT; c2.height = FACE_INPUT;
+    return faceapi.nets.tinyFaceDetector.locateFaces(c2, new faceapi.TinyFaceDetectorOptions({ inputSize: FACE_INPUT, scoreThreshold: 0.5 }))
+      .then(function () { return faceapi.nets.faceLandmark68Net.detectLandmarks(c); })
+      .then(function () { return faceapi.nets.faceRecognitionNet.computeFaceDescriptor(c); })
+      .then(function () { tmark('warmup', performance.now() - t0); });
+  }
+  function faceInit() {
+    if (FACE.p) return FACE.p;
+    var t0 = performance.now();
+    FACE.p = swReady().then(loadLib).then(function () {
+      return faceapi.tf && faceapi.tf.ready ? faceapi.tf.ready().then(function () { TM.backend = faceapi.tf.getBackend(); }) : null;
+    }).then(function () {
+      return Promise.all([timedLoad(faceapi.nets.tinyFaceDetector, 'model_tiny'), timedLoad(faceapi.nets.faceLandmark68Net, 'model_landmark'),
+                          timedLoad(faceapi.nets.faceRecognitionNet, 'model_recognition')]);
+    }).then(function () { tmark('models_total', performance.now() - t0); return warmup(); })
+      .then(function () { FACE.ready = true; });
+    FACE.p.catch(function () { FACE.p = null; });                 // allow a retry after a network error
+    return FACE.p;
+  }
+  var CAM = {};
+  function startCamera(id) {
+    if (CAM[id]) return CAM[id];
+    var t0 = performance.now();
+    CAM[id] = navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 } }, audio: false }).then(function (st) {
+      $(id).srcObject = st;
+      return new Promise(function (r) { if ($(id).readyState >= 2) r(); else $(id).onloadeddata = function () { r(); }; });
+    }).then(function () { tmark('camera', performance.now() - t0); });
+    CAM[id].catch(function () { CAM[id] = null; });
+    return CAM[id];
+  }
+  /** One live descriptor from the camera (detector → landmarks → descriptor).
+   *  Ordinary IN/OUT uses 224 for speed and retries once at 320 only when no face is found.
+   *  Initial registration always uses 320 for the best template quality. Nothing is persisted locally. */
+  function capture(videoId, kind) {
+    var t0 = performance.now(), v = $(videoId), firstSize = kind === 'register' ? 320 : FACE_INPUT;
+    TM.captures[kind]++;
+    function one(size) {
+      var t1 = performance.now(), opts = new faceapi.TinyFaceDetectorOptions({ inputSize: size, scoreThreshold: 0.5 });
+      return faceapi.detectAllFaces(v, opts).withFaceLandmarks().withFaceDescriptors().then(function (all) {
+        tmark('descriptor', performance.now() - t1);
+        if (all && all.length > 1) {                                    // far-away background faces (much smaller) are ignored
+          var big = Math.max.apply(null, all.map(function (f) { return f.detection.box.area; }));
+          all = all.filter(function (f) { return f.detection.box.area >= big * 0.25; });
+        }
+        if (all && all.length > 1) throw new Error('ক্যামেরায় একাধিক মুখ দেখা যাচ্ছে। শুধু আপনি থাকুন, অন্যরা সরে দাঁড়ান।');
+        if (all && all.length === 1) return all[0];
+        if (size !== 320) return one(320);
+        return null;
+      });
+    }
+    return one(firstSize).then(function (d) {
+      tmark('capture_total', performance.now() - t0);
+      if (!d) throw new Error('মুখ পাওয়া যায়নি। ক্যামেরার দিকে সোজা তাকান।');
+      return Array.prototype.slice.call(d.descriptor);
+    });
+  }
+  function descriptor() { return capture('v', 'register'); }
+  /** Debug: detector input size benchmark on this phone's live camera (nothing sent). */
+  function bench() {
+    var sizes = [160, 224, 320], out = [], ref = null, v = $('v');
+    function dist(a, b) { var s = 0; for (var i = 0; i < a.length; i++) s += (a[i] - b[i]) * (a[i] - b[i]); return Math.sqrt(s); }
+    function one(size, n) {
+      var t0 = performance.now();
+      return faceapi.detectSingleFace(v, new faceapi.TinyFaceDetectorOptions({ inputSize: size, scoreThreshold: 0.5 })).withFaceLandmarks().withFaceDescriptor()
+        .then(function (d) { return { ms: performance.now() - t0, d: d ? Array.prototype.slice.call(d.descriptor) : null }; });
+    }
+    var chain = Promise.resolve();
+    sizes.slice().reverse().forEach(function (size) {
+      chain = chain.then(function () {
+        var rs = []; var c2 = one(size);                                  // untimed first run per size (shader compile for the new shape)
+        [0, 1, 2].forEach(function () { c2 = c2.then(function () { return one(size).then(function (r) { rs.push(r); }); }); });
+        return c2.then(function () {
+          var found = rs.filter(function (r) { return r.d; });
+          if (size === 320 && found.length) ref = found[0].d;
+          out.push(size + ': ' + Math.round(rs.reduce(function (n, r) { return n + r.ms; }, 0) / rs.length) + ' ms avg · found ' + found.length + '/3' +
+            (ref && found.length ? ' · distance to 320 ' + dist(found[0].d, ref).toFixed(3) : ''));
+          $('benchOut').textContent = out.join('\n');
+        });
+      });
+    });
+    return chain;
+  }
+  /* ---------- 6.5d secure local face cache + one-shot pre-capture ----------
+   * Reference cache: encrypted centroid only, stored in IndexedDB with a non-extractable AES-GCM key.
+   * Live descriptor: RAM only, short lived; never written to storage. Final approval always happens on the server. */
+  var FACE_DB = 'usm-face-private-v1' + (COMPANY_KEY ? '-' + COMPANY_KEY : ''), PRE_FACE_MS = 5000, LOCAL_HINT_LIMIT = 0.82;
+  function idbOpen() {
+    return new Promise(function (resolve, reject) {
+      if (!window.indexedDB || !window.crypto || !crypto.subtle) return reject(new Error('secure cache unavailable'));
+      var q = indexedDB.open(FACE_DB, 1);
+      q.onupgradeneeded = function () { var db = q.result; if (!db.objectStoreNames.contains('keys')) db.createObjectStore('keys'); if (!db.objectStoreNames.contains('data')) db.createObjectStore('data'); };
+      q.onsuccess = function () { resolve(q.result); }; q.onerror = function () { reject(q.error); };
+    });
+  }
+  function idbGet(store, key) { return idbOpen().then(function (db) { return new Promise(function (resolve, reject) { var q = db.transaction(store, 'readonly').objectStore(store).get(key); q.onsuccess = function () { resolve(q.result); }; q.onerror = function () { reject(q.error); }; }); }); }
+  function idbPut(store, key, val) { return idbOpen().then(function (db) { return new Promise(function (resolve, reject) { var tx = db.transaction(store, 'readwrite'); tx.objectStore(store).put(val, key); tx.oncomplete = function () { resolve(); }; tx.onerror = function () { reject(tx.error); }; }); }); }
+  function faceKey() {
+    return idbGet('keys', 'aes').then(function (k) { if (k) return k; return crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']).then(function (key) { return idbPut('keys', 'aes', key).then(function () { return key; }); }); });
+  }
+  function b64(a) { var u = new Uint8Array(a), x = ''; for (var i = 0; i < u.length; i++) x += String.fromCharCode(u[i]); return btoa(x); }
+  function unb64(s) { var x = atob(s), u = new Uint8Array(x.length); for (var i = 0; i < x.length; i++) u[i] = x.charCodeAt(i); return u; }
+  function cacheFaceRef(ref) {
+    if (!ref || !ref.employee_id || !ref.centroid || ref.centroid.length !== 128) return Promise.resolve();
+    var iv = crypto.getRandomValues(new Uint8Array(12)), plain = new TextEncoder().encode(JSON.stringify(ref));
+    return faceKey().then(function (key) { return crypto.subtle.encrypt({ name: 'AES-GCM', iv: iv }, key, plain); })
+      .then(function (ct) { return idbPut('data', 'emp:' + ref.employee_id, { iv: b64(iv), ct: b64(ct), version: ref.cache_version, model: ref.model_version }); })
+      .catch(function () {});
+  }
+  function loadFaceRef(empId, version) {
+    return idbGet('data', 'emp:' + empId).then(function (rec) {
+      if (!rec || rec.version !== version) return null;
+      return faceKey().then(function (key) { return crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(rec.iv) }, key, unb64(rec.ct)); })
+        .then(function (pt) { var ref = JSON.parse(new TextDecoder().decode(pt)); return ref && ref.centroid && ref.centroid.length === 128 ? ref : null; });
+    }).catch(function () { return null; });
+  }
+  function localDist(a, b) { if (!a || !b || a.length !== b.length) return null; var x = 0; for (var i = 0; i < a.length; i++) { var d = a[i] - b[i]; x += d * d; } return Math.sqrt(x); }
+  function faceStage(which, state, text) { var box = $(which === 'kiosk' ? 'kFaceStage' : 'faceStage'); var label = $(which === 'kiosk' ? 'kFaceStatus' : 'faceStatus'); if (box) box.setAttribute('data-stage', state); if (label) label.textContent = text; }
+  function setFaceHint(text, ok) {
+    var e = $('fhint'); if (!e) return; e.textContent = text; e.className = ok === true ? 'ok' : ok === false ? 'bad' : 'muted';
+    var state = ok === false ? 'error' : ok === true ? 'ready' : /যাচাই|প্রস্তুত হচ্ছে/.test(text) ? 'checking' : 'idle';
+    faceStage('self', state, text.replace(/^✓\s*/, ''));
+  }
+  // Visual feedback is informational, never an attendance approval.
+  function buttonWorking(id, working, label) { var b = $(id); if (!b) return; b.classList.toggle('is-working', !!working); if (working && label) b.textContent = label; }
+  document.addEventListener('pointerdown', function (ev) { var b = ev.target.closest && ev.target.closest('button'); if (b && !b.disabled) b.classList.add('is-pressed'); }, {passive:true});
+  ['pointerup','pointercancel','pointerleave'].forEach(function (eventName) { document.addEventListener(eventName, function () { document.querySelectorAll('button.is-pressed').forEach(function (b) { b.classList.remove('is-pressed'); }); }, {passive:true}); });
+  // Security (Phase 8): the phone no longer receives or stores any face template — only the server compares faces.
+  // Templates cached by older versions of this page are deleted once.
+  function ensureFaceRef() { return Promise.resolve(null); }
+  (function purgeFaceCache() {
+    try { if (!window.indexedDB) return; var q = indexedDB.deleteDatabase(FACE_DB); q.onerror = q.onblocked = function () {}; } catch (e) { /* nothing cached */ }
+  })();
+  function clearPreFace() { S.preFace = null; if (S.preFaceTimer) clearTimeout(S.preFaceTimer); S.preFaceTimer = null; }
+  function freshPreFace() { return S.preFace && (Date.now() - S.preFace.at <= PRE_FACE_MS) ? S.preFace : null; }
+  function primeFace() {
+    var m = S.me;
+    if (!S.ready || busy || !m || !m.face_registered || S.mode === 'KIOSK') return Promise.resolve(null);
+    if (freshPreFace()) return Promise.resolve(S.preFace);
+    if (S.preFaceP) return S.preFaceP;
+    setFaceHint('মুখ প্রস্তুত হচ্ছে…', null);
+    var t0 = performance.now();
+    S.preFaceP = Promise.all([ensureFaceRef(), capture('v', 'mark')]).then(function (x) {
+      var ref = x[0], d = x[1], dist = ref ? localDist(ref.centroid, d) : null;
+      S.preFace = { descriptor: d, at: Date.now(), local_distance: dist };
+      tmark('pre_capture', performance.now() - t0);
+      if (dist !== null && dist > LOCAL_HINT_LIMIT) setFaceHint('মুখ পরিষ্কার নয় — সোজা তাকান', false);
+      else setFaceHint('✓ মুখ প্রস্তুত — এখন ' + (m.next === 'IN' ? 'IN' : 'OUT') + ' দিন', true);
+      S.preFaceTimer = setTimeout(function () { if (S.preFace && Date.now() - S.preFace.at >= PRE_FACE_MS) { S.preFace = null; setFaceHint('মুখ সোজা রেখে ' + (S.me && S.me.next === 'OUT' ? 'OUT' : 'IN') + ' চাপুন', null); } }, PRE_FACE_MS + 100);
+      return S.preFace;
+    }).catch(function () { setFaceHint('মুখ ক্যামেরার মাঝে রাখুন', null); return null; }).then(function (x) { S.preFaceP = null; return x; });
+    return S.preFaceP;
+  }
+  function getFastDescriptor() {
+    // Phase 7 security: the warm descriptor is only a readiness hint.
+    // Capture a NEW frame after the actual user tap: no stale pre-tap replay.
+    var wait = S.preFaceP || Promise.resolve();                  // a running readiness capture finishes first (one face engine)
+    return wait.catch(function () {}).then(function () { clearPreFace(); return capture('v', 'mark'); });
+  }
+  var busy = false;
+  /** Camera that paused (screen off, app switch) or lost its track is restarted before the capture. */
+  function ensureCamera(id) {
+    id = id || 'v';
+    var v = $(id), st = v && v.srcObject, tr = st && st.getVideoTracks ? st.getVideoTracks()[0] : null;
+    if (CAM[id] && tr && tr.readyState === 'live') {
+      if (v.paused && v.play) { var pl = v.play(); if (pl && pl.catch) pl.catch(function () {}); }
+      return CAM[id];
+    }
+    if (st && st.getTracks) st.getTracks().forEach(function (t) { t.stop(); });
+    CAM[id] = null; return startCamera(id);
+  }
+  document.addEventListener('visibilitychange', function () { if (!document.hidden && S.ready && S.mode !== 'KIOSK' && staffTab === 'attendance') ensureCamera('v').catch(function () {}); });
+  function camErr(e) { return e && /NotAllowed|Permission|Security/i.test(e.name || e.message || '') ? 'ক্যামেরা চালু করুন — ব্রাউজারে এই পাতাকে ক্যামেরার অনুমতি দিন।' : 'ক্যামেরা চালু করুন — অন্য অ্যাপে ক্যামেরা খোলা থাকলে বন্ধ করে আবার চেষ্টা করুন।'; }
+
+  /* Progress: মুখ যাচাই → লোকেশন যাচাই → হাজিরা সংরক্ষণ → হাজিরা সম্পন্ন (the last only after the server confirms). */
+  var STEPS = ['face', 'gps', 'save', 'done'];
+  function step(k) {
+    var pr = $('prog'); pr.classList.toggle('hidden', !k); var at = STEPS.indexOf(k);
+    pr.querySelectorAll('li').forEach(function (li) { var i = STEPS.indexOf(li.getAttribute('data-s')); li.className = k === 'done' || i < at ? 'ok' : i === at ? 'on' : ''; });
+    if (k && k !== 'done') buttonWorking('act', true, { face: 'মুখ যাচাই হচ্ছে…', gps: 'লোকেশন যাচাই হচ্ছে…', save: 'হাজিরা সংরক্ষণ হচ্ছে…', check: 'আগের হাজিরার অবস্থা যাচাই হচ্ছে…' }[k] || 'অপেক্ষা করুন…');
+  }
+  function showDone(ev) {
+    $('done').classList.remove('hidden');
+    staffText('doneWhat', (ev.event_type === 'IN' ? 'IN (আসা)' : 'OUT (বের হওয়া)') + ' · ' + hm(ev.event_time));
+    step('done'); setFaceHint('✓ হাজিরা সম্পন্ন', true); msg('', true);
+    if (navigator.vibrate) try { navigator.vibrate(80); } catch (e) {}
+  }
+  /* An attendance write whose answer was lost stays "pending" on this phone (id + IN/OUT only, no biometrics).
+   * The next tap re-uses the SAME client_event_id, so the server returns the first result instead of writing twice. */
+  var PEND_KEY = 'usm_pending_att';
+  function pendGet() { try { var x = JSON.parse(get(PEND_KEY) || 'null'); return x && S.me && x.emp === S.me.employee_id && Date.now() - x.at < 6 * 3600000 ? x : null; } catch (e) { return null; } }
+  function pendPut(x) { put(PEND_KEY, x ? JSON.stringify(x) : ''); }
+  function checkPending(silent) {
+    var pd = pendGet(); if (!pd) return Promise.resolve(null);
+    if (!silent) { step('check'); msg('আগের হাজিরার অবস্থা যাচাই হচ্ছে…', true); }
+    return call('attendance.selfCheck', { client_event_id: pd.cid }, false, { timeoutMs: 20000 }).then(function (r) {
+      if (r.found) { pendPut(null); return { saved: true, event: r.event }; }
+      if (Date.now() - pd.at > 6 * 60000) pendPut(null);          // older than any running request: nothing was saved
+      return { saved: false };
+    });
+  }
+
+  function render() {
+    var m = S.me, t = m.today || {};
+    $('who').textContent = m.full_name + (m.branch ? ' · ' + m.branch.name : '');
+    $('state').textContent = m.next === 'OUT' && m.last ? 'ভেতরে আছেন · IN ' + hm(t.in || m.last.event_time) : t.out ? 'বেরিয়েছেন · OUT ' + hm(t.out) : 'আজ এখনো হাজিরা নেই';
+    staffText('tIn', hm(t.in)); staffText('tOut', hm(t.out));
+    var x = m.expected || {};
+    $('duty').textContent = 'তারিখ ' + m.work_date + ' · ডিউটি: ' + (x.kind === 'WORK' ? x.duty_code + ' ' + x.start + '–' + x.end : x.kind === 'OFF' ? 'আজ সাপ্তাহিক ছুটি' : 'রোস্টার নেই');
+    var su = $('setupSteps'); su.classList.toggle('hidden', !!m.face_registered);
+    if (!m.face_registered) su.textContent = 'সেটআপ: ✓ লগইন · ✓ ফোন অনুমোদন · ✓ PIN · ○ মুখ নিবন্ধন (শেষ ধাপ)';
+    var b = $('act');
+    b.disabled = !S.ready || busy;
+    if (!busy) b.textContent = !S.ready ? 'প্রস্তুত হচ্ছে…' : !m.face_registered ? 'মুখ নিবন্ধন করুন' : m.next === 'IN' ? 'হাজিরা দিন · IN' : 'হাজিরা দিন · OUT';
+    if (S.ready && !TM.marks.ready) tmark('ready', performance.now());
+    if (S.ready && m.face_registered && !busy) setTimeout(function () { primeFace(); }, 120);
+  }
+
+  function refresh() { var t0 = performance.now(); return call('attendance.me').then(function (m) { if (!TM.marks.me) tmark('me', performance.now() - t0); S.me = m; clearPreFace(); render(); if (staffTab === 'profile') renderStaffProfile(); }); }
+
+  function msg(t, ok) { $('msg').textContent = t; $('msg').className = ok ? 'ok' : 'bad'; }
+
+  function registerFace() {
+    var samples = [], pos = S.pos || {};
+    setFaceHint('মুখ নিবন্ধন: ভালো আলোয়, একা, সোজা তাকিয়ে থাকুন…', null); msg('৩ বার ছবি নেওয়া হবে — নড়বেন না।', true);
+    var wait = function () { return new Promise(function (r) { setTimeout(r, 700); }); };
+    return ensureCamera('v').then(descriptor).then(function (d) { samples.push(d); msg('১/৩ ✓ — আবার সোজা তাকান', true); return wait(); })
+      .then(descriptor).then(function (d) { samples.push(d); msg('২/৩ ✓ — শেষবার', true); return wait(); })
+      .then(descriptor).then(function (d) { samples.push(d); msg('সংরক্ষণ হচ্ছে…', true);
+        return call('face.registerSelf', { descriptors: samples, model_version: MODEL_VERSION, lat: pos.lat, lng: pos.lng, face_count: 1 }, true); })
+      .then(function () { samples.length = 0; setFaceHint('✓ মুখ নিবন্ধন সম্পন্ন', true); msg('✓ সেটআপ সম্পন্ন! এখন থেকে শুধু "হাজিরা দিন" চাপুন।', true); });
+  }
+
+  /** ONE TAP: fresh face capture + location evidence (in parallel) → server verifies and saves → success only on the server's answer. */
+  function act() {
+    var m = S.me; if (!m || busy) return;
+    busy = true; $('act').disabled = true; $('done').classList.add('hidden'); msg('', true);
+    var tAct = performance.now(), job;
+    if (!m.face_registered) job = registerFace();
+    else {
+      var pd = pendGet(), cid = pd ? pd.cid : uid(), expect = pd ? pd.expect : m.next, exempt = !!(m.branch && m.branch.geo_exempt);
+      step('face'); setFaceHint('মুখ যাচাই হচ্ছে…', null);
+      var posP = freshPos();                                         // GPS runs while the camera captures
+      job = ensureCamera('v').then(function () { return getFastDescriptor(); }, function (e) { var x = new Error(camErr(e)); x.code = 'CAMERA'; throw x; })
+        .then(function (d) {
+          step('gps');
+          return posP.then(function (pos) {
+            if (!pos && !exempt) { var x = new Error(S.posErr === 'DENIED' ? 'লোকেশন চালু করুন — ব্রাউজারে এই পাতাকে লোকেশনের অনুমতি দিন।' : 'লোকেশন চালু করুন — খোলা জায়গায় বা জানালার কাছে গিয়ে আবার চাপুন।'); x.code = 'GPS'; throw x; }
+            step('save');
+            pendPut({ cid: cid, expect: expect, at: pd ? pd.at : Date.now(), emp: m.employee_id });
+            var tA = performance.now();
+            return call('attendance.self', { client_event_id: cid, descriptor: d, lat: pos && pos.lat, lng: pos && pos.lng, expect_type: expect, face_count: 1 }, true, { requestId: cid, timeoutMs: 30000 })
+              .then(function (r) { tmark('api_roundtrip', performance.now() - tA); tmark('mark_total', performance.now() - tAct); return r; });
+          });
+        })
+        .then(function (r) { pendPut(null); clearPreFace(); showDone(r.event); },
+          function (e) {
+            if (e.code !== 'NETWORK') { if (['CAMERA', 'GPS'].indexOf(e.code) < 0 && pendGet()) pendPut(null); throw e; }   // the server answered "no": nothing was saved
+            return checkPending().then(function (c) {                     // lost answer: ask the server before anything else
+              if (c && c.saved) { showDone(c.event); return; }
+              var x = new Error('হাজিরা নিশ্চিত হয়নি — ইন্টারনেট দেখে আবার চাপুন। আবার চাপলে দুবার হাজিরা হবে না।'); x.code = 'NETWORK'; throw x;
+            }, function () { var x = new Error('ইন্টারনেট সংযোগ পরীক্ষা করুন। আবার চাপলে আগের হাজিরার অবস্থা আগে যাচাই হবে — দুবার হবে না।'); x.code = 'NETWORK'; throw x; });
+          });
+    }
+    job.catch(function (e) { step(''); setFaceHint('আবার চেষ্টা করুন', false); msg(e.message || String(e)); })
+      .then(function () { busy = false; buttonWorking('act', false); return refresh(); }).catch(function () {})
+      .then(function () { busy = false; buttonWorking('act', false); if (S.me) render(); SELF.month = {}; });   // calendar re-reads when opened; no extra call now
+  }
+
+  $('saveUrl').onclick = function () { S.url = DEFAULT_EXEC_URL; boot(); };
+  var lastPwd = '';                                                       // kept in memory only for the first-login change
+  var loginBusy = false;
+  function setLoginBusy(b) { loginBusy = b; $('doLogin').disabled = b; $('doKiosk').disabled = b; buttonWorking('doLogin', b, 'লগইন হচ্ছে…'); buttonWorking('doKiosk', b, 'যাচাই হচ্ছে…'); if (!b) { $('doLogin').textContent = 'লগইন'; $('doKiosk').textContent = 'ম্যানেজার: এই ল্যাপটপ কিয়স্ক হিসেবে নিবন্ধন করুন'; } }
+  function login(kioskSetup) {
+    if (loginBusy) return;                                                 // a second tap must not start a second login
+    $('lmsg').textContent = '';
+    var label = ((navigator.userAgentData && navigator.userAgentData.platform) || navigator.platform || '') + ' · ' + (screen.width + 'x' + screen.height);
+    var pwd = $('p').value;                                                // the password actually sent — captured at tap time
+    setLoginBusy(true);
+    var uname = $('u').value.trim(), req = devRequest; devRequest = null;
+    call('auth.login', { username: uname, password: pwd, device: kioskSetup ? 'WEB' : 'PHONE', device_id: kioskSetup ? undefined : DEV, device_label: label, device_request: req || undefined }).then(function (d) {
+      setLoginBusy(false); devStage(null);
+      if (!kioskSetup) put('usm_user', uname);
+      lastPwd = pwd; $('p').value = ''; S.token = d.token;
+      if (d.user && d.user.mustChangePassword) {
+        if (kioskSetup) { S.token = ''; throw new Error('প্রথমে মূল অ্যাপে পাসওয়ার্ড বদলান।'); }
+        put('usm_att_token', d.token); show('pwd'); return;
+      }
+      lastPwd = '';
+      if (!kioskSetup) { put('usm_att_token', d.token); boot(); return; }
+      return call('kiosk.branches').then(function (list) {
+        if (!list.length) throw new Error('আপনার কোনো শাখায় কিয়স্কের অনুমতি নেই।');
+        show('kpick');
+        $('kbranches').innerHTML = '';
+        list.forEach(function (b) {
+          var btn = document.createElement('button'); btn.textContent = 'নিবন্ধন: ' + b.branch_code + ' · ' + b.branch_name;
+          btn.onclick = function () {
+            var lab = $('klabel').value.trim();
+            if (!lab) { $('kpmsg').textContent = 'ল্যাপটপের নাম লিখুন'; return; }
+            call('kiosk.register', { branch_id: b.branch_id, label: lab, device_id: DEV }, true).then(function (k) {
+              return call('auth.logout').catch(function () {}).then(function () {      // manager session leaves the device
+                S.token = k.device_token; S.mode = 'KIOSK'; put('usm_att_token', k.device_token); put('usm_mode', 'KIOSK'); boot();
+              });
+            }).catch(function (e) { $('kpmsg').textContent = e.message; });
+          };
+          $('kbranches').appendChild(btn);
+        });
+      });
+    }).catch(function (e) {
+      setLoginBusy(false); $('lmsg').textContent = e.message;
+      if (!kioskSetup && /^DEVICE_(APPROVAL_PENDING|NOT_REGISTERED|REQUEST_REJECTED)$/.test(e.code || '')) { put('usm_user', uname); devStage(e.code, e.details || {}); }
+      else devStage(null);
+    });
+  }
+  /* First-day / new-phone status inside the login card. Remembered on this phone (stage + ID only; never the PIN). */
+  var devRequest = null;
+  function devStage(code, d) {
+    var box = $('devBox'); d = d || {};
+    if (!code) { box.classList.add('hidden'); box.innerHTML = ''; put('usm_setup', ''); return; }
+    var stage = d.stage || (code === 'DEVICE_APPROVAL_PENDING' ? 'PENDING' : code === 'DEVICE_REQUEST_REJECTED' ? 'REJECTED' : 'REPLACE');
+    put('usm_setup', stage); box.classList.remove('hidden');
+    var form = '<label for="dvReason">কারণ</label><select id="dvReason"><option value="NEW">নতুন ফোন</option><option value="LOST">ফোন হারিয়েছে</option><option value="DAMAGED">ফোন নষ্ট</option><option value="OTHER">অন্য কারণ</option></select>' +
+      '<label for="dvNote">নোট (ঐচ্ছিক)</label><textarea id="dvNote" rows="2" maxlength="120"></textarea><button type="button" id="dvSend">নতুন ফোনের আবেদন করুন</button>';
+    if (stage === 'PENDING') box.innerHTML = '<b>⏳ আপনার ফোন অনুমোদনের অপেক্ষায় আছে</b><p class="muted">' + (d.replace ? 'নতুন ফোনের আবেদন HR-এর কাছে গেছে। অনুমোদন হলে আগের ফোনটি বন্ধ হবে।' : 'প্রথমবার: HR আপনার পরিচয় যাচাই করে ফোনটি অনুমোদন দেবেন।') +
+      (d.this_phone === false ? ' (অন্য একটি ফোনের আবেদন অপেক্ষায় আছে — আপনি না করে থাকলে HR-কে জানান।)' : '') + ' অনুমোদনের পর PIN দিয়ে নিচের বাটন চাপুন।</p><button type="button" id="dvCheck">অবস্থা দেখুন</button>';
+    else if (stage === 'REJECTED') box.innerHTML = '<b>✗ HR এই ফোনটি অনুমোদন করেননি</b>' + (d.reason ? '<p>কারণ: ' + esc(d.reason) + '</p>' : '') + '<p class="muted">HR-এর সঙ্গে কথা বলে চাইলে আবার আবেদন করুন।</p>' + form;
+    else box.innerHTML = '<b>আপনার আগের ফোনটি নিবন্ধিত আছে। নতুন ফোন ব্যবহার করতে চান?</b><p class="muted">আগের ফোন হাতে না থাকলেও আবেদন করা যায়। HR পরিচয় যাচাই করে অনুমোদন দিলে আগের ফোন বন্ধ হবে, এই ফোন চালু হবে।</p>' + form;
+    if ($('dvCheck')) $('dvCheck').onclick = function () { if (!$('p').value) { $('lmsg').textContent = 'PIN লিখে আবার চাপুন।'; $('p').focus(); return; } login(false); };
+    if ($('dvSend')) $('dvSend').onclick = function () {
+      if (!$('p').value) { $('lmsg').textContent = 'PIN লিখে আবার চাপুন।'; $('p').focus(); return; }
+      devRequest = { reason: $('dvReason').value, note: $('dvNote').value.trim() }; login(false);
+    };
+  }
+  $('npSave').onclick = function () {
+    var a = $('np1').value, b = $('np2').value, btn = $('npSave');
+    $('npMsg').textContent = '';
+    if (a !== b) { $('npMsg').textContent = 'দুটো পাসওয়ার্ড মেলেনি'; return; }
+    if (!lastPwd) {                                                        // page was reloaded: the temporary password is not in memory
+      S.token = ''; put('usm_att_token', ''); show('login'); $('lmsg').textContent = 'আবার লগইন করে নতুন পাসওয়ার্ড দিন।'; return;
+    }
+    btn.disabled = true;
+    call('auth.changePassword', { oldPassword: lastPwd, newPassword: a }, true).then(function () {
+      btn.disabled = false; lastPwd = ''; $('np1').value = ''; $('np2').value = ''; boot();      // same token, same phone binding
+    }).catch(function (e) { btn.disabled = false; $('npMsg').textContent = e.code === 'AUTH_FAILED' ? 'অস্থায়ী পাসওয়ার্ড মেলেনি — আবার লগইন করুন।' : e.message; });
+  };
+  $('doLogin').onclick = function () { login(false); };
+  $('doKiosk').onclick = function () { login(true); };
+
+  /* ---------- kiosk ---------- */
+  function kmsg(t, ok) { $('kmsg').textContent = t; $('kmsg').className = ok ? 'ok' : 'bad'; }
+  function kload() {
+    return call('kiosk.staff').then(function (k) {
+      S.kiosk = k; $('kname').textContent = 'Registered Kiosk · ' + k.branch_name; $('klab').textContent = k.kiosk_label || ''; $('kstaff').innerHTML = '';
+      k.staff.forEach(function (p) {
+        var b = document.createElement('button'); b.className = 'sec';
+        b.textContent = p.full_name + ' #' + p.employee_id + ' — ' + (p.face_registered ? (p.next === 'IN' ? 'IN দেবেন' : 'OUT দেবেন') : 'মুখ নিবন্ধন নেই');
+        b.disabled = !p.face_registered;
+        b.onclick = function () { S.sel = p; $('ksel').textContent = p.full_name + ' — ক্যামেরার দিকে তাকান'; $('kgo').disabled = !S.ready; $('kgo').textContent = 'যাচাই করে ' + p.next + ' দিন'; };
+        $('kstaff').appendChild(b);
+      });
+    });
+  }
+  $('kgo').onclick = function () {
+    var p = S.sel; if (!p || $('kgo').disabled) return; $('kgo').disabled = true; buttonWorking('kgo', true, 'মুখ যাচাই হচ্ছে…'); faceStage('kiosk', 'checking', 'মুখ যাচাই হচ্ছে…'); kmsg('মুখ যাচাই হচ্ছে…', true);
+    var tAct = performance.now();
+    capture('kv', 'kiosk').then(function (d) {
+      var tA = performance.now();
+      return call('kiosk.mark', { client_event_id: uid(), employee_id: p.employee_id, descriptor: d, expect_type: p.next, face_count: 1 }, true)
+        .then(function (r) { tmark('api_roundtrip', performance.now() - tA); tmark('mark_total', performance.now() - tAct); return r; });
+    }).then(function (r) { faceStage('kiosk', 'success', '✓ হাজিরা সম্পন্ন'); kmsg(p.full_name + ': ' + r.event.event_type + ' ' + r.event.event_time.slice(11, 16), true); })
+      .catch(function (e) { faceStage('kiosk', 'error', 'মুখ যাচাই হয়নি'); kmsg(e.message); })
+      .then(function () { buttonWorking('kgo', false); S.sel = null; $('ksel').textContent = 'নিচে নিজের নাম বাছুন'; $('kgo').textContent = '—'; return kload(); }).catch(function () {});
+  };
+  $('kexit').onclick = function () {
+    if (!confirm('কিয়স্ক বন্ধ করবেন? এই ল্যাপটপের নিবন্ধন বাতিল হবে; আবার চালু করতে ম্যানেজারকে নিবন্ধন করতে হবে।')) return;
+    call('kiosk.release', {}, true).catch(function () {}).then(function () { S.token = ''; S.mode = ''; put('usm_att_token', ''); put('usm_mode', ''); boot(); });
+  };
+  $('logout').onclick = function () { call('auth.logout').catch(function () {}).then(function () { S.token = ''; put('usm_att_token', ''); boot(); }); };
+  $('act').onclick = act;
+  var crBusy = false;
+  $('crSend').onclick = function () {
+    if (crBusy) return;
+    var t = $('crTime').value, r = $('crReason').value.trim();
+    if (!t || !r) { $('crMsg').textContent = 'তারিখ-সময় ও কারণ দিন।'; $('crMsg').className = 'bad'; return; }
+    crBusy = true; $('crSend').disabled = true;
+    call('attendance.correctionRequest', { request_id: uid(), action: 'ADD', event_type: $('crType').value, event_time: t.replace('T', ' ').slice(0, 16), reason: r }, true)
+      .then(function () { $('crMsg').textContent = '✓ আবেদন পাঠানো হয়েছে — ম্যানেজার/HR অনুমোদন দিলে হাজিরা ঠিক হবে।'; $('crMsg').className = 'ok'; $('crReason').value = ''; SELF.requests = null; SELF.month = {}; })
+      .catch(function (e) { $('crMsg').textContent = e.message; $('crMsg').className = 'bad'; })
+      .then(function () { crBusy = false; $('crSend').disabled = false; });
+  };
+
+  function boot() {
+    if (!S.url) { show('cfg'); return; }
+    faceInit().catch(function () {});                                   // library/models/warm-up start now — also while the user types the login
+    $('url').value = S.url;
+    if (!S.token) {
+      show('login'); if (!$('u').value) $('u').value = get('usm_user');
+      var st = get('usm_setup');
+      if (st === 'PENDING') devStage('DEVICE_APPROVAL_PENDING', { stage: 'PENDING' });
+      return;
+    }
+    if (S.mode === 'KIOSK') {
+      show('kiosk');
+      kload().catch(function (e) { if (/AUTH/.test(e.code || '')) { S.token = ''; S.mode = ''; put('usm_att_token', ''); put('usm_mode', ''); show('login'); $('lmsg').textContent = 'এই কিয়স্কের নিবন্ধন বাতিল হয়েছে — ম্যানেজার দিয়ে আবার নিবন্ধন করুন।'; } else kmsg(e.message); });
+      Promise.all([startCamera('kv'), faceInit()])                    // camera + models (+ warm-up) in parallel with the staff list
+        .then(function () { S.ready = true; faceStage('kiosk', 'idle', 'মুখ বৃত্তের মাঝখানে রাখুন'); tmark('ready', performance.now()); if (S.sel) $('kgo').disabled = false; }).catch(function (e) { kmsg('ক্যামেরা/মডেল চালু হয়নি: ' + e.message); });
+      return;
+    }
+    show('main'); watchGps();
+    refresh().then(function () {
+      return checkPending(true).then(function (c) { if (c && c.saved) { showDone(c.event); refresh(); } }, function () {});
+    }).then(function () { setTimeout(loadHomeExtras, 2500); }).catch(function (e) {
+      if (e.code === 'PASSWORD_CHANGE_REQUIRED') { S.token = ''; put('usm_att_token', ''); show('login'); $('lmsg').textContent = 'আবার লগইন করে নতুন পাসওয়ার্ড দিন।'; }
+      else if (/SESSION|AUTH|DEVICE/.test(e.code || '')) { S.token = ''; put('usm_att_token', ''); show('login'); $('u').value = get('usm_user'); $('lmsg').textContent = 'আবার লগইন করুন।'; } else msg(e.message); });
+    Promise.all([startCamera('v'), faceInit()])                       // camera + models (+ warm-up) in parallel with attendance.me
+      .then(function () { S.ready = true; faceStage('self', 'idle', 'মুখ বৃত্তের মাঝখানে রাখুন'); if (S.me) { render(); primeFace(); } else setFaceHint('ক্যামেরা প্রস্তুত', null); })
+      .catch(function (e) { msg(e && e.name ? camErr(e) : 'মুখ যাচাইয়ের ফাইল লোড হয়নি — ইন্টারনেট সংযোগ পরীক্ষা করে পাতা আবার খুলুন।'); });
+  }
+  $('benchBtn').onclick = function () { if (FACE.ready) bench(); };
+  boot();
+})();
+</script>
+<script>
+/* Help & first-use guide for staff (Bangla). Static text only — nothing is sent to the server. */
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var esc = function (x) { return String(x).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); };
+  var T = [
+    { t: 'হাজিরা দেবেন কীভাবে (এক চাপে)', s: ['অ্যাপ খুলুন — "◉ হাজিরা দিন" পাতায় বড় বাটন থাকে। ক্যামেরা ও লোকেশনের অনুমতি একবার দিন।', 'মুখ বৃত্তের মাঝখানে রেখে বড় বাটন একবার চাপুন। IN না OUT — সার্ভার নিজে ঠিক করে, বাটনে লেখা থাকে।', 'অ্যাপ নিজে করবে: মুখ যাচাই → লোকেশন যাচাই → হাজিরা সংরক্ষণ → "✓ হাজিরা সম্পন্ন" ও সার্ভারের সময়।', 'সবুজ "হাজিরা সম্পন্ন" না দেখা পর্যন্ত হাজিরা হয়নি। বারবার চাপবেন না — দুবার হাজিরা কখনো হবে না।'] },
+    { t: 'প্রথম দিন: সেটআপ (৫ ধাপ)', s: ['Employee ID ও HR-এর দেওয়া PIN দিয়ে লগইন করুন।', 'ফোন অনুমোদন: প্রথমবার অ্যাপ নিজে HR-এর কাছে অনুরোধ পাঠায়। "অনুমোদনের অপেক্ষায়" দেখালে HR-কে জানান।', 'অনুমোদনের পর একই আইডি-PIN দিয়ে "অবস্থা দেখুন"/লগইন চাপুন।', 'নিজের নতুন ৬ সংখ্যার PIN দিন (কাউকে বলবেন না)।', 'মুখ নিবন্ধন: ভালো আলোয়, একা, চশমা/মাস্ক ছাড়া সোজা তাকিয়ে "মুখ নিবন্ধন করুন" চাপুন — ৩টি ছবি নেওয়া হবে। এরপর শুধু "হাজিরা দিন"।'] },
+    { t: 'নতুন ফোন / ফোন হারিয়েছে', s: ['নতুন ফোনে অ্যাপ খুলে আইডি-PIN দিন। দেখাবে: "আপনার আগের ফোনটি নিবন্ধিত আছে। নতুন ফোন ব্যবহার করতে চান?"', 'কারণ বাছুন (নতুন ফোন / হারিয়েছে / নষ্ট / অন্য) → "নতুন ফোনের আবেদন করুন"। আগের ফোন হাতে না থাকলেও হবে।', 'HR আপনার পরিচয় যাচাই করে অনুমোদন দিলে আগের ফোন বন্ধ হবে। তারপর নতুন ফোনে লগইন করুন।', 'প্রত্যাখ্যাত হলে কারণ দেখাবে; HR-এর সঙ্গে কথা বলে আবার আবেদন করা যায়। নিজে নিজে ফোন অনুমোদন করা যায় না।'] },
+    { t: 'আমার হাজিরা (মাসিক ক্যালেন্ডার)', s: ['"▦ আমার হাজিরা" ট্যাবে পুরো মাস: P উপস্থিত, A অনুপস্থিত, OFF সাপ্তাহিক ছুটি, H সরকারি ছুটি, PL সবেতন ছুটি, UL বিনা বেতনে ছুটি।', 'কোনো দিনে চাপুন — IN/OUT সময়, চূড়ান্ত কি না দেখাবে।', 'ভুল থাকলে সেখান থেকেই "হাজিরা সংশোধনের আবেদন" চাপুন।'] },
+    { t: 'আবেদন: ছুটি', s: ['"✎ আবেদন" → "ছুটির আবেদন": ধরন, শুরু ও শেষের তারিখ, কারণ লিখে জমা দিন।', '"আমার আবেদনের অবস্থা"-তে অপেক্ষমাণ/অনুমোদিত/প্রত্যাখ্যাত দেখুন।'] },
+    { t: 'আবেদন: অগ্রিম (Advance)', s: ['"✎ আবেদন" → "অগ্রিমের আবেদন": টাকার পরিমাণ, প্রতি মাসে কত কাটবে (প্রস্তাব), কারণ দিন।', 'ধাপ: ম্যানেজার/HR → ফাইন্যান্স (চূড়ান্ত পরিমাণ, কিস্তি, শুরুর মাস) → টাকা প্রদান।', 'শুধু আবেদন বা অনুমোদনে বেতন থেকে কিছু কাটে না — টাকা হাতে পাওয়ার পরই কিস্তি শুরু হয়।', 'টাকা দেওয়ার আগে পর্যন্ত নিজের আবেদন বাতিল করা যায়। একসাথে একটির বেশি অগ্রিম আবেদন চলে না।'] },
+    { t: 'আবেদন: হাজিরা সংশোধন', s: ['OUT/IN দিতে ভুলে গেলে "হাজিরা সংশোধনের আবেদন": কী যোগ হবে, তারিখ-সময় ও কারণ দিন (৩১ দিনের মধ্যে)।', 'ম্যানেজার/HR অনুমোদন দিলে হাজিরা ঠিক হয়। নিজে হাজিরা বদলানো যায় না।'] },
+    { t: 'বেতন কীভাবে গোনা হয়', s: ['উপস্থিত (P), সাপ্তাহিক ছুটি (OFF), সরকারি ছুটি (H), অনুমোদিত সবেতন ছুটি (PL) = বেতনের দিন।', 'অনুপস্থিত (A) ও বিনা বেতনে ছুটি (UL) দিনের বেতন কাটে। অনুমোদিত ওভারটাইম আলাদা যোগ হয়।'] },
+    { t: 'কিয়স্ক (শাখার ল্যাপটপ) — ম্যানেজারের জন্য', s: ['ম্যানেজার লগইন পাতায় "কিয়স্ক হিসেবে নিবন্ধন" দিয়ে শাখা বেছে ল্যাপটপ নিবন্ধন করুন।', 'কর্মী তালিকা থেকে নিজের নাম বেছে ক্যামেরায় মুখ দেখিয়ে হাজিরা দেন।'] }
+  ];
+  var F = [
+    { q: '"ফোন অনুমোদনের অপেক্ষায় আছে"', a: 'HR এখনো অনুমোদন করেননি। HR-কে জানান। অনুমোদনের পর PIN দিয়ে "অবস্থা দেখুন" চাপুন — আবার নতুন আবেদন লাগবে না।' },
+    { q: 'আলোতে মুখ সোজা রেখে আবার চেষ্টা করুন', a: 'ভালো আলোয় যান, মুখ সোজা রাখুন, চশমা/মাস্ক খুলুন, ক্যামেরার লেন্স মুছে নিন। বারবার না মিললে HR "পুনঃনিবন্ধনের অনুমতি" দেবেন।' },
+    { q: '"ক্যামেরায় শুধু আপনি থাকুন"', a: 'ক্যামেরায় শুধু আপনার মুখ থাকতে হবে। পাশে বা পেছনে কেউ থাকলে সরে দাঁড়াতে বলুন, তারপর আবার চাপুন।' },
+    { q: 'লোকেশন চালু করুন / এলাকার বাইরে (GPS)', a: 'ফোনের Location চালু করুন ও এই পাতাকে অনুমতি দিন। শাখার ভিতরে থাকুন; ঘরের ভিতরে GPS দুর্বল হলে জানালার কাছে গিয়ে আবার চাপুন।' },
+    { q: 'ইন্টারনেট সংযোগ পরীক্ষা করুন / "আগের হাজিরার অবস্থা যাচাই হচ্ছে"', a: 'উত্তর আসার আগে নেট চলে গেলে অ্যাপ আগে সার্ভারে জেনে নেয় হাজিরা হয়েছে কি না। হয়ে থাকলে "হাজিরা সম্পন্ন" দেখাবে; না হলে আবার চাপুন — দুবার হাজিরা কখনো হবে না।' },
+    { q: 'অনেকক্ষণ লোড হচ্ছে', a: 'প্রথমবার মুখ যাচাইয়ের ফাইল ডাউনলোডে সময় লাগে; পরে ফোনেই থাকে, দ্রুত খোলে। মোবাইল ডেটা/Wi-Fi দেখে নিন।' },
+    { q: 'লগইন হচ্ছে না / PIN ভুলে গেছি', a: 'ইউজারনেম = আপনার Employee ID। PIN ভুলে গেলে HR-কে রিসেট করতে বলুন।' },
+    { q: 'ক্যামেরা চালু করুন', a: 'ব্রাউজারের Settings → Site settings → Camera থেকে এই পাতাকে Allow দিন। অন্য অ্যাপে ক্যামেরা খোলা থাকলে বন্ধ করে পাতা আবার খুলুন।' },
+    { q: 'হাজিরা ভুল দেখাচ্ছে', a: '"▦ আমার হাজিরা"-তে দিনটিতে চাপুন → "হাজিরা সংশোধনের আবেদন"। চূড়ান্ত (লক) দিন হলে HR-এর সঙ্গে কথা বলুন।' }
+  ];
+  function render(q) {
+    q = String(q || '').trim().toLowerCase();
+    var hit = function (x) { return !q || String(x).toLowerCase().indexOf(q) >= 0; };
+    var h = T.filter(function (x) { return hit(x.t) || x.s.some(hit); }).map(function (x) { return '<details><summary>' + esc(x.t) + '</summary><ol>' + x.s.map(function (y) { return '<li>' + esc(y) + '</li>'; }).join('') + '</ol></details>'; }).join('') +
+      F.filter(function (x) { return hit(x.q) || hit(x.a); }).map(function (x) { return '<details><summary>' + esc(x.q) + '</summary><p>' + esc(x.a) + '</p></details>'; }).join('');
+    $('hlpBody').innerHTML = h || '<p class="muted">কিছু পাওয়া যায়নি।</p>';
+  }
+  function open() {
+    var b = document.createElement('div'); b.className = 'hlp-back'; b.id = 'hlpRoot';
+    b.innerHTML = '<div class="hlp" role="dialog" aria-modal="true" aria-label="সাহায্য"><h1>? সাহায্য</h1><input id="hlpQ" type="search" placeholder="খুঁজুন… (যেমন: ফেস, ছুটি, GPS)">' +
+      '<div id="hlpBody"></div><button type="button" class="sec" id="hlpTour">ধাপে ধাপে পরিচিতি</button><button type="button" id="hlpX">বন্ধ করুন</button></div>';
+    document.body.appendChild(b); render('');
+    $('hlpQ').oninput = function () { render(this.value); };
+    $('hlpX').onclick = close; $('hlpTour').onclick = function () { close(); tour(true); };
+    b.addEventListener('click', function (e) { if (e.target === b) close(); });
+  }
+  function close() { var r = $('hlpRoot'); if (r) r.parentNode.removeChild(r); }
+  function tour(force) {
+    var key = 'usm_staff_tour_v2';
+    try { if (!force && localStorage.getItem(key)) return; } catch (e) { /* storage blocked: show once per page */ }
+    var steps = [
+      { el: null, t: 'স্বাগতম!', b: 'এই অ্যাপে এক চাপে হাজিরা দেবেন, মাসের হাজিরা দেখবেন, ছুটি/অগ্রিম/সংশোধনের আবেদন করবেন।' },
+      { el: 'faceStage', t: 'মুখ দেখান', b: 'মুখ বৃত্তের মাঝখানে রাখুন। বৃত্ত সবুজ হলে প্রস্তুত।' },
+      { el: 'act', t: 'এক চাপে হাজিরা', b: 'শুধু এই বাটন একবার চাপুন — মুখ ও লোকেশন যাচাই করে হাজিরা সংরক্ষণ হবে। সবুজ "হাজিরা সম্পন্ন" দেখলে শেষ।' },
+      { el: 'staffNavCal', t: 'আমার হাজিরা ও আবেদন', b: 'নিচের ট্যাবে মাসের ক্যালেন্ডার, আর "আবেদন"-এ ছুটি, অগ্রিম ও হাজিরা সংশোধন।' },
+      { el: 'helpBtn', t: 'সাহায্য', b: 'যেকোনো সমস্যায় "? সাহায্য" চাপুন: মুখ না মেলা, লোকেশন, নতুন ফোন — সব সমাধান এখানে।' }];
+    var i = 0, box = document.createElement('div'); box.className = 'tour'; document.body.appendChild(box);
+    function el(k) { if (k === 'staffNavCal') return document.querySelector('[data-staff-tab="calendar"]'); return k ? $(k) : null; }
+    function hl(on) { var e = el(steps[i] && steps[i].el); if (e) { e.classList.toggle('tour-hl', on); if (on && e.scrollIntoView) e.scrollIntoView({ block: 'center' }); }
+      if (on) { var top = e && e.getBoundingClientRect().top > window.innerHeight / 2; box.style.top = top ? '0' : ''; box.style.bottom = top ? 'auto' : ''; } }   // never cover the highlighted control
+    // tapping any real control (attendance, tabs, leave) ends the guide
+    document.addEventListener('click', function end(ev) { if (!box.parentNode) return document.removeEventListener('click', end, true); if (!box.contains(ev.target)) { done(); document.removeEventListener('click', end, true); } }, true);
+    function done() { hl(false); try { localStorage.setItem(key, '1'); } catch (e) {} if (box.parentNode) box.parentNode.removeChild(box); }
+    function show() {
+      var s = steps[i], last = i === steps.length - 1;
+      box.innerHTML = '<div class="tour-c"><div class="muted">' + (i + 1) + ' / ' + steps.length + '</div><b>' + esc(s.t) + '</b><p>' + esc(s.b) + '</p><div class="row">' +
+        '<button type="button" class="sec" id="tSkip">এড়িয়ে যান</button>' + (i ? '<button type="button" class="sec" id="tBack">পেছনে</button>' : '') + '<button type="button" id="tNext">' + (last ? 'শেষ' : 'পরের') + '</button></div></div>';
+      hl(true);
+      $('tSkip').onclick = done; if ($('tBack')) $('tBack').onclick = function () { hl(false); i--; show(); };
+      $('tNext').onclick = function () { hl(false); if (last) done(); else { i++; show(); } };
+    }
+    show();
+  }
+  $('helpBtn').onclick = open; $('helpBtnLogin').onclick = open;
+  // first time the staff screen appears on this phone → short guide
+  var main = $('main');
+  if (window.MutationObserver) new MutationObserver(function (m, o) { if (!main.classList.contains('hidden')) { o.disconnect(); setTimeout(function () { tour(false); }, 800); } })
+    .observe(main, { attributes: true, attributeFilter: ['class'] });
+  window.USM_HELP = { open: open, tour: tour };
+})();
+</script>
+</body>
+</html>
